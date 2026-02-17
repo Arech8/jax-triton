@@ -54,6 +54,9 @@ try:
   import triton._C.libtriton as _triton
   import triton.backends.nvidia.compiler as cb
 
+  import triton.experimental.gluon._runtime as gl_runtime
+  from triton.experimental.gluon import language as gl
+
   CAN_USE_TRITON = True
 except ModuleNotFoundError:
   pass
@@ -116,7 +119,7 @@ def avals_to_layouts(avals):
 def get_triton_type(obj: Any) -> str:
   if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
     return f"*{_JAX_TO_TRITON_TYPE_MAP[obj.dtype]}"
-  if isinstance(obj, tl.constexpr):
+  if isinstance(obj, (tl.constexpr, gl.constexpr)):
     obj = obj.value
   if isinstance(obj, bool):  # True == isinstance(True, int) !!!
     return "B"
@@ -458,9 +461,11 @@ def get_or_create_triton_kernel(
     backend.load_dialects(context)
     codegen_fns = backend.get_codegen_implementation(options)
 
+    real_ASTSource = gl_runtime.GluonASTSource if isinstance(fn, gl_runtime.GluonJITFunction) else tc.ASTSource
+
     module = code_gen.ast_to_ttir(
         fn,
-        tc.ASTSource(
+        real_ASTSource(
             fn, constexprs=constants, signature=signature, attrs=attrs
         ),
         options=options,
@@ -601,9 +606,9 @@ def triton_kernel_call_lowering(
     configs = updated_configs
     fn = fn.fn
 
-  if not isinstance(fn, triton.JITFunction):
+  if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
     raise ValueError(
-        "`kernel` must be a Triton `JITFunction`, `Heuristics` or `Autotuner`."
+        "`kernel` must be a Triton `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner`."
     )
 
   outputs_offset = len(ctx.avals_in) + len(scalar_args)
@@ -762,6 +767,7 @@ def triton_call(
     *args: jax.Array | bool | int | float | np.float32,
     kernel: (
         triton.JITFunction
+        | gl_runtime.GluonJITFunction
         | triton.runtime.Heuristics
         | triton.runtime.Autotuner
     ),
@@ -836,7 +842,8 @@ def triton_call(
   Args:
     *args: Inputs for the Triton kernel.
     kernel: A Triton kernel (e.g. a function decorated with `triton.jit`). All
-      static values should be annotated with `triton.language.constexpr`.
+      static values should be annotated with `triton.language.constexpr` or
+      `triton.experimental.gluon.language.constexpr`.
     out_shape: A `jax.ShapeDtypeStruct` (or something that has `.shape` and
       `.dtype` attributes) or a sequence thereof that specify the output(s) of
       the kernel. Pointers for each of the `jax.ShapeDtypeStruct`s in
