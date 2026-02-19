@@ -8,7 +8,6 @@ from jax import random
 import jax_triton as jt
 import numpy as np
 import triton
-import time
 
 # import triton.language as tl
 from triton.experimental import gluon
@@ -60,6 +59,18 @@ def memcpy_kernel(in_ptr, xnumel, out_ptr, XBLOCK: gl.constexpr):
     gl.store(out_ptr + i, value)
 
 
+@gluon.jit
+def memcpy_inplace_output_kernel(in_ptr, out_ptr, xnumel, XBLOCK: gl.constexpr):
+  # Each program processes the addresses [pid, pid + BLOCK_X), clamped into
+  # the range [0, xnumel).
+  pid = gl.program_id(0)
+  start = pid * XBLOCK
+  end = min(start + XBLOCK, xnumel)
+  for i in range(start, end):
+    value = gl.load(in_ptr + i)
+    gl.store(out_ptr + i, value)
+
+
 # autotuner example isn't ported as Triton's autotuner depends on torch internally
 
 
@@ -77,7 +88,7 @@ class GluonTest(parameterized.TestCase):
 
     input = jnp.array(42.314, dtype=dtype)
     output = copy_scalar(input)
-    np.testing.assert_equal(input, output)
+    np.testing.assert_equal(output, input)
 
   @parameterized.product(XBLOCK=[64], xnumel=[40, 500, 16 * 1024 + 1])
   def test_memcpy(self, XBLOCK, xnumel):
@@ -97,7 +108,32 @@ class GluonTest(parameterized.TestCase):
 
     input = random.uniform(random.key(0), (xnumel,), dtype=dtype)
     output = memcpy(input, XBLOCK)
-    np.testing.assert_array_equal(input, output)
+    np.testing.assert_array_equal(output, input)
+
+  @parameterized.product(XBLOCK=[64], xnumel=[40, 500, 16 * 1024 + 1])
+  def test_memcpy_inplace_output(self, XBLOCK, xnumel):
+    dtype = jnp.float32
+
+    def memcpy_inplace_output(input, output, XBLOCK):
+      assert input.size == output.size and input.dtype == output.dtype
+      assert input.shape == output.shape
+      xnumel = input.size
+      return jt.triton_call(
+        input,
+        output,
+        xnumel,
+        kernel=memcpy_inplace_output_kernel,
+        out_shape=jax.ShapeDtypeStruct(shape=input.shape, dtype=input.dtype),
+        input_output_aliases={0: 1},
+        grid=(triton.cdiv(xnumel, XBLOCK),),
+        num_warps=1,
+        XBLOCK=XBLOCK,
+      )
+
+    input = random.uniform(random.key(0), (xnumel,), dtype=dtype)
+    output = jnp.empty_like(input)
+    memcpy_inplace_output(input, output, XBLOCK)
+    np.testing.assert_array_equal(output, input)
 
 
 if __name__ == "__main__":
