@@ -12,7 +12,7 @@ import triton
 # import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.language.extra import libdevice
+# from triton.language.extra import libdevice
 
 
 config.parse_flags_with_absl()
@@ -79,6 +79,7 @@ class GluonTest(parameterized.TestCase):
   def test_copy_scalar_kernel(self, dtype):
     def copy_scalar(input: jnp.ndarray) -> jnp.ndarray:
       assert input.size == 1 and input.ndim == 0
+      # note, this also checks behaviour in the absense of metaparams args.
       return jt.triton_call(
         input,
         kernel=copy_scalar_kernel,
