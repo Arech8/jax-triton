@@ -138,8 +138,8 @@ def get_x_vals():
   x_vals += [(v, 57344, 8192) for v in [1, 2, 4, 8, 16, 32, 64]]
   x_vals += [(v, 8192, 28672) for v in [1, 2, 4, 8, 16, 32, 64]]
   x_vals += [(1, 1, 32)]  # minimal case
-  # return x_vals
-  return [(128, 1280, 8192)]
+  return x_vals
+  # return [(128, 1280, 8192)]
 
 
 def mxfp4_to_f32(x):
@@ -226,7 +226,6 @@ def test_gemm_afp4_wfp4(
   skip_reduce,
   impl,
 ):
-
   if not is_fp4_avail():
     pytest.skip("MXFP4 not supported on this architecture (requires CDNA4).")
 
@@ -293,4 +292,4 @@ def test_gemm_afp4_wfp4(
 
 
 if __name__ == "__main__":
-  sys.exit(pytest.main([__file__]))
+  sys.exit(pytest.main(sys.argv[1:]))

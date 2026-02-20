@@ -1,5 +1,6 @@
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/gluon/gemm_a8w8.py
-# rewritten to use JAX primitives and match jax-triton calling conventions
+# Kernels are copypasted, launch function was rewritten to use JAX primitives and match
+# jax-triton calling conventions
 
 import functools
 import json
@@ -483,7 +484,7 @@ def _get_config(
 
   return _get_config._config_dict["any"]
 
-
+@functools.partial(jax.jit, static_argnums=4)
 def gemm_afp4wfp4(
   x: jnp.ndarray,
   w: jnp.ndarray,
@@ -516,11 +517,6 @@ def gemm_afp4wfp4(
 
   assert is_fp4_avail(), "MXFP4 is not available on your device"
 
-  print(f"x: {x.shape}, {x.dtype}")
-  print(f"w: {w.shape}, {w.dtype}")
-  print(f"x_scales: {x_scales.shape}, {x_scales.dtype}")
-  print(f"w_scales: {w_scales.shape}, {w_scales.dtype}")
-
   M, K = x.shape
   N, K = w.shape
 
@@ -533,7 +529,10 @@ def gemm_afp4wfp4(
   if config["BLOCK_SIZE_K"] >= K * 2:
     config["NUM_KSPLIT"] = 1
 
-  if config["NUM_KSPLIT"] > 1:
+  assert config["NUM_KSPLIT"] >= 1
+  unit_NUM_KSPLIT = config["NUM_KSPLIT"] == 1
+
+  if not unit_NUM_KSPLIT:
     SPLITK_BLOCK_SIZE = (
       triton.cdiv((2 * triton.cdiv(K, config["NUM_KSPLIT"])), config["BLOCK_SIZE_K"])
       * config["BLOCK_SIZE_K"]
@@ -543,19 +542,19 @@ def gemm_afp4wfp4(
 
   config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
 
-  if config["NUM_KSPLIT"] > 1:
+  if not unit_NUM_KSPLIT:
     if _USE_GEMM_SPLITK_BF16:
-      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=dtype, device=x.device)
+      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=dtype) #, device=x.device)
     else:
-      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=jnp.float32, device=x.device)
+      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=jnp.float32)# , device=x.device)
 
     y_pp_stride = (y_pp.shape[1] * y_pp.shape[2], y_pp.shape[2], 1)
   else:
     y_pp = None
     y_pp_stride = None
 
-  if y is None and (config["NUM_KSPLIT"] == 1 or not skip_reduce):
-    y = jnp.empty((M, N), dtype=dtype, device=x.device)
+  if y is None and (unit_NUM_KSPLIT or not skip_reduce):
+    y = jnp.empty((M, N), dtype=dtype) #, device=x.device)
 
   grid = lambda META: (  # noqa: E731
     (
@@ -565,14 +564,9 @@ def gemm_afp4wfp4(
     ),
   )
 
-  out_tensor_y = y if config["NUM_KSPLIT"] == 1 else y_pp
+  out_tensor_y = y if unit_NUM_KSPLIT else y_pp
 
-  print(f"out_tensor_y: {out_tensor_y.shape}, {out_tensor_y.dtype}")
-  print(f"y: {y.shape}, {y.dtype}")
-  if y_pp:
-    print(f"y_pp: {y_pp.shape}, {y_pp.dtype}")
-
-  """jt.triton_call(
+  result = jt.triton_call(
     x,
     w,
     out_tensor_y,
@@ -585,42 +579,11 @@ def gemm_afp4wfp4(
     1,  # x.stride(1),
     w.shape[1],  # w.stride(0),
     1,  # w.stride(1),
-    0 if config["NUM_KSPLIT"] == 1 else y_pp_stride[0],
+    0 if unit_NUM_KSPLIT else y_pp_stride[0],
     # y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp_stride[1],
-    y.shape[1] if config["NUM_KSPLIT"] == 1 else y_pp_stride[1],
+    y.shape[1] if unit_NUM_KSPLIT else y_pp_stride[1],
     # y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp_stride[2],
-    1 if config["NUM_KSPLIT"] == 1 else y_pp_stride[2],
-    x_scales.shape[1],  # x_scales.stride(0),
-    1,  # x_scales.stride(1),
-    w_scales.shape[1],  # w_scales.stride(0),
-    1,  # w_scales.stride(1),
-    kernel=_gemm_afp4wfp4_kernel,
-    input_output_aliases={2: 0},
-    out_shape=jax.ShapeDtypeStruct(shape=out_tensor_y.shape, dtype=out_tensor_y.dtype),
-    grid=grid,
-    num_warps=config["num_warps"],
-    num_stages=config["num_stages"],
-    metaparams=config,
-  )"""
-
-  jt.triton_call(
-    x,
-    w,
-    out_tensor_y,
-    x_scales,
-    w_scales,
-    M,
-    N,
-    K,
-    x.shape[1],  # x.stride(0),
-    1,  # x.stride(1),
-    w.shape[1],  # w.stride(0),
-    1,  # w.stride(1),
-    0 if config["NUM_KSPLIT"] == 1 else y_pp_stride[0],
-    # y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp_stride[1],
-    y.shape[1] if config["NUM_KSPLIT"] == 1 else y_pp_stride[1],
-    # y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp_stride[2],
-    1 if config["NUM_KSPLIT"] == 1 else y_pp_stride[2],
+    1 if unit_NUM_KSPLIT else y_pp_stride[2],
     x_scales.shape[1],  # x_scales.stride(0),
     1,  # x_scales.stride(1),
     w_scales.shape[1],  # w_scales.stride(0),
@@ -634,7 +597,10 @@ def gemm_afp4wfp4(
     metaparams=config,
   )
 
-  if config["NUM_KSPLIT"] > 1:
+  if unit_NUM_KSPLIT:
+    y = result
+  else:
+    y_pp = result
     if skip_reduce:
       return y_pp
 
@@ -647,7 +613,7 @@ def gemm_afp4wfp4(
       triton.cdiv(N, REDUCE_BLOCK_SIZE_N),
     )
 
-    jt.triton_call(
+    y = jt.triton_call(
       y_pp,
       y,
       M,
