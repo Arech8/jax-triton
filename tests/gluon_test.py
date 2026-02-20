@@ -176,10 +176,7 @@ class GluonTest(parameterized.TestCase):
     # allocation/copy should happen.
 
     np.testing.assert_(output.is_deleted())
-
-    result_ptr = result.unsafe_buffer_pointer()
-    np.testing.assert_equal(output_ptr, result_ptr)
-
+    np.testing.assert_equal(output_ptr, result.unsafe_buffer_pointer())
     np.testing.assert_array_equal(result, input)
 
 

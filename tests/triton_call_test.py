@@ -83,6 +83,17 @@ def add(x, y, *, kernel=add_kernel, **kwargs):
 
 
 @triton.jit
+def inc_inplace_kernel(x_in_out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+  pid = tl.program_id(axis=0)
+  block_start = pid * BLOCK_SIZE
+  offsets = block_start + tl.arange(0, BLOCK_SIZE)
+  mask = offsets < n_elements
+  x = tl.load(x_in_out_ptr + offsets, mask=mask)
+  output = x + 1
+  tl.store(x_in_out_ptr + offsets, output, mask=mask)
+
+
+@triton.jit
 def matmul_kernel(
     a_ptr,
     b_ptr,
@@ -300,16 +311,6 @@ class TritonKernelCallTest(parameterized.TestCase):
     np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
 
   def test_input_output_aliasing(self):
-    @triton.jit
-    def inc_inplace_kernel(x_in_out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-      pid = tl.program_id(axis=0)
-      block_start = pid * BLOCK_SIZE
-      offsets = block_start + tl.arange(0, BLOCK_SIZE)
-      mask = offsets < n_elements
-      x = tl.load(x_in_out_ptr + offsets, mask=mask)
-      output = x + 1
-      tl.store(x_in_out_ptr + offsets, output, mask=mask)
-
     size = 8
     x = random.normal(random.PRNGKey(0), [size])
     expected = x + 1
@@ -322,6 +323,29 @@ class TritonKernelCallTest(parameterized.TestCase):
         BLOCK_SIZE=1,
         input_output_aliases={0: 0},
     )
+    np.testing.assert_allclose(out, expected)
+
+  def test_input_output_aliasing_donate(self):
+    size = 8
+    x = random.normal(random.PRNGKey(0), [size])
+    expected = x + 1
+
+    x_ptr = x.unsafe_buffer_pointer()
+    out = jax.jit(
+      lambda x: jt.triton_call(
+        x,
+        size,
+        kernel=inc_inplace_kernel,
+        out_shape=x,
+        grid=(8,),
+        BLOCK_SIZE=1,
+        input_output_aliases={0: 0},
+      ),
+      donate_argnums=(0,),
+    )(x)
+
+    np.testing.assert_(x.is_deleted())
+    np.testing.assert_equal(x_ptr, out.unsafe_buffer_pointer())
     np.testing.assert_allclose(out, expected)
 
   @parameterized.parameters(False, True)
