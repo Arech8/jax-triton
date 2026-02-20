@@ -543,8 +543,17 @@ def triton_kernel_call_lowering(
   for idx, dtype, v in scalar_args:
     args.insert(idx, v)
     arg_dtypes.insert(idx, dtype)
-  args.extend(ctx.avals_out)
-  arg_dtypes.extend(map(get_triton_type, ctx.avals_out))
+  # extracting only avails_out not mentioned in input_output_aliases mapping
+  assert isinstance(input_output_aliases, tuple)
+  input_output_aliases = dict(input_output_aliases)
+  strictly_out_avals = [
+    aval
+    for i, aval in enumerate(ctx.avals_out)
+    if i not in input_output_aliases.values()
+  ]
+  args.extend(strictly_out_avals)
+  arg_dtypes.extend(map(get_triton_type, strictly_out_avals))
+
   named_args = dict(unsafe_zip(fn.arg_names, args))
 
   if isinstance(fn, autotuner.Autotuner):
@@ -688,7 +697,7 @@ def triton_kernel_call_lowering(
     named_scalar_args = {fn.arg_names[i]: v for i, _, v in scalar_args}
     input_output_aliases_with_sizes = tuple(
         (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
-        for input_idx, output_idx in input_output_aliases
+        for input_idx, output_idx in input_output_aliases.items()
     )
     kernel_call = triton_kernel_call_lib.TritonAutotunedKernelCall(
         f"{kernel_call_name} ({fn.fn.__name__}) {named_scalar_args}",
@@ -703,7 +712,7 @@ def triton_kernel_call_lowering(
       custom_call_target_name,
       api_version=2,
       backend_config=zlib.compress(call_proto),
-      operand_output_aliases=dict(input_output_aliases),
+      operand_output_aliases=input_output_aliases,
   )
   return rule(ctx, *array_args)
 
