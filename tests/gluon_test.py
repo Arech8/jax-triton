@@ -125,7 +125,7 @@ class GluonTest(parameterized.TestCase):
         xnumel,
         kernel=memcpy_inplace_output_kernel,
         out_shape=jax.ShapeDtypeStruct(shape=input.shape, dtype=input.dtype),
-        input_output_aliases={0: 1},
+        input_output_aliases={1: 0},
         grid=(triton.cdiv(xnumel, XBLOCK),),
         num_warps=1,
         XBLOCK=XBLOCK,
@@ -133,8 +133,11 @@ class GluonTest(parameterized.TestCase):
 
     input = random.uniform(random.key(0), (xnumel,), dtype=dtype)
     output = jnp.empty_like(input)
-    memcpy_inplace_output(input, output, XBLOCK)
-    np.testing.assert_array_equal(output, input)
+    # without a buffer donation, JAX will still make a copy of output before passing
+    # it to the kernel, so the kernel could modify it. Hence we have to accept that
+    # inout-output buffer copy as a result here
+    result = memcpy_inplace_output(input, output, XBLOCK)
+    np.testing.assert_array_equal(result, input)
 
 
 if __name__ == "__main__":
