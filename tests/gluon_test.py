@@ -113,6 +113,9 @@ class GluonTest(parameterized.TestCase):
 
   @parameterized.product(XBLOCK=[64], xnumel=[40, 500, 16 * 1024 + 1])
   def test_memcpy_inplace_output(self, XBLOCK, xnumel):
+    """A variation of memcpy test with a pre-allocated output buffer.
+    Note that the buffer is still being copied by JAX upon kernel launch, so the kernel
+    could modify it."""
     dtype = jnp.float32
 
     def memcpy_inplace_output(input, output, XBLOCK):
@@ -135,8 +138,48 @@ class GluonTest(parameterized.TestCase):
     output = jnp.empty_like(input)
     # without a buffer donation, JAX will still make a copy of output before passing
     # it to the kernel, so the kernel could modify it. Hence we have to accept that
-    # inout-output buffer copy as a result here
+    # inout-output buffer copy as a result here.
     result = memcpy_inplace_output(input, output, XBLOCK)
+    np.testing.assert_array_equal(result, input)
+
+  @parameterized.product(XBLOCK=[64], xnumel=[40, 500, 16 * 1024 + 1])
+  def test_memcpy_inplace_output_donate(self, XBLOCK, xnumel):
+    """A variation of memcpy test with pre-allocated output buffer and buffer donation,
+    preventing buffer copy being made by JAX."""
+    dtype = jnp.float32
+
+    @jax.jit(static_argnums=(2,), donate_argnums=(1,))
+    def memcpy_inplace_output_donate(input, output, XBLOCK):
+      assert input.size == output.size and input.dtype == output.dtype
+      assert input.shape == output.shape
+      xnumel = input.size
+      return jt.triton_call(
+        input,
+        output,
+        xnumel,
+        kernel=memcpy_inplace_output_kernel,
+        out_shape=jax.ShapeDtypeStruct(shape=input.shape, dtype=input.dtype),
+        input_output_aliases={1: 0},
+        grid=(triton.cdiv(xnumel, XBLOCK),),
+        num_warps=1,
+        XBLOCK=XBLOCK,
+      )
+
+    input = random.uniform(random.key(0), (xnumel,), dtype=dtype)
+
+    output = jnp.empty_like(input)
+    output_ptr = output.unsafe_buffer_pointer()
+
+    result = memcpy_inplace_output_donate(input, output, XBLOCK)
+    # we still have to use a dedicated result object, but this time it should reuse
+    # the same underlying data buffer as was allocated for the output, so no additional
+    # allocation/copy should happen.
+
+    np.testing.assert_(output.is_deleted())
+
+    result_ptr = result.unsafe_buffer_pointer()
+    np.testing.assert_equal(output_ptr, result_ptr)
+
     np.testing.assert_array_equal(result, input)
 
 
