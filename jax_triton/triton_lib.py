@@ -540,8 +540,13 @@ def triton_kernel_call_lowering(
     zeroed_outputs,
     debug,
     serialized_metadata,
-    **metaparams,
+    metaparams: tuple[tuple[str, Any], ...],
 ):
+  # we have to pass metaparams dictionary as a tuple to allow hashing necessary for
+  # lowering via xla_primitive_callable()
+  assert isinstance(metaparams, tuple), "metaparams must be tuple[tuple[str, Any], ...]"
+  metaparams = dict(metaparams)  # wil crash if tuple format is incompatible
+
   kernel_call_name = name
   args = list(ctx.avals_in)
   arg_dtypes = list(map(get_triton_type, ctx.avals_in))
@@ -786,7 +791,10 @@ def triton_call(
     ) = (),
     debug: bool = False,
     serialized_metadata: bytes = b"",
-    **metaparams: Any,
+    # two mutually exclusive ways to pass metaparams to let convenient use and allow
+    # passing params that clash with other parameters of this and related methods.
+    metaparams:dict | None = None,
+    **metaparams_dict: Any,
 ) -> Any:
   """Calls a Triton kernel with `jax.Array` arguments.
 
@@ -865,8 +873,14 @@ def triton_call(
     debug: Prints out intermediate IRs if True for debugging purposes.
     serialized_metadata: Arbitrary metadata that will be added into the
       serialized kernel call.
-    **metaparams: Additional keyword arguments that will be provided to a `grid`
-      (if it is a function) and to the Triton kernel as `constexpr` arguments.
+    metaparams: A dictionary of arguments that will be provided to a `grid`
+      (if it is a function) and to the Triton kernel as `constexpr` arguments. Use it
+      instead of **metaparams_dict when keys might conflict with regular triton_call()
+      arguments. Note, either metaparams or metaparams_dict should be used, not both.
+    **metaparams_dict: Additional keyword arguments that will be provided to a `grid`
+      (if it is a function) and to the Triton kernel as `constexpr` arguments. Use it
+      instead of `metaparams` when keys won't conflict with regular triton_call()
+      arguments. Note, either metaparams or metaparams_dict should be used, not both.
 
   Returns:
     Outputs from the Triton kernel.
@@ -875,6 +889,17 @@ def triton_call(
     raise ValueError(
         "`triton_call` is only available when `triton` is installed."
     )
+
+  assert not metaparams or not metaparams_dict, (
+    "Either metaparams or metaparams_dict should be used, not both."
+  )
+  if not metaparams:
+    metaparams = metaparams_dict
+  if metaparams is None:
+    metaparams = {}
+  else:
+    assert isinstance(metaparams, dict), "metaparams must be a dictionary"
+
   out_shape = tree_util.tree_map(
       lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
@@ -912,6 +937,6 @@ def triton_call(
       zeroed_outputs=zeroed_outputs,
       debug=debug,
       serialized_metadata=serialized_metadata,
-      **metaparams,
+      metaparams=tuple(metaparams.items()),
   )
   return tree_util.tree_unflatten(out_tree, out_flat)
