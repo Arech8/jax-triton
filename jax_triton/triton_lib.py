@@ -164,10 +164,8 @@ def aval_size_bytes(aval):
   return np.dtype(aval.dtype).itemsize * aval.size
 
 
-def get_cuda_backend(device, compute_capability):
-  target = cb.GPUTarget("cuda", compute_capability, 32)
-  backend = cb.CUDABackend(target)
-  return backend
+def make_gpu_target_cuda(device, compute_capability):
+  return cb.GPUTarget("cuda", compute_capability, 32)
 
 
 _IS_HIPBackend_PATCHED = False
@@ -203,15 +201,13 @@ def _patch_hip_backend():
     hb.HIPBackend.is_within_2gb = fixed_is_within_2gb
 
 
-def get_hip_backend(device, compute_capability):
+def make_gpu_target_hip(device, compute_capability):
   # TODO(Arech): remove _patch_hip_backend() once Triton releases a fix
   _patch_hip_backend()
 
   arch = triton_kernel_call_lib.get_arch_details(device)
   arch = arch.split(":")[0]
-  target = hb.GPUTarget("hip", arch, 64)
-  backend = hb.HIPBackend(target)
-  return backend
+  return hb.GPUTarget("hip", arch, 64)
 
 
 @dataclasses.dataclass
@@ -362,7 +358,7 @@ _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
 
 
 def get_or_create_triton_kernel(
-    backend_init_func,
+    make_gpu_target_func,
     platform,
     fn,
     arg_dtypes,
@@ -389,7 +385,8 @@ def get_or_create_triton_kernel(
   if num_ctas > 1 and compute_capability < 90:
     raise ValueError("num_ctas > 1 unsupported before Hopper.")
 
-  backend = backend_init_func(device, compute_capability)
+  gpu_target = make_gpu_target_func(device, compute_capability)
+  backend = triton.compiler.make_backend(gpu_target)
 
   signature = {fn.arg_names[i]: v for i, v in enumerate(arg_dtypes)}
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
@@ -462,17 +459,10 @@ def get_or_create_triton_kernel(
     codegen_fns = backend.get_codegen_implementation(options)
 
     real_ASTSource = gl_runtime.GluonASTSource if isinstance(fn, gl_runtime.GluonJITFunction) else tc.ASTSource
+    module = real_ASTSource(
+        fn, constexprs=constants, signature=signature, attrs=attrs
+    ).make_ir(gpu_target, options, codegen_fns, backend.get_module_map(), context)
 
-    module = code_gen.ast_to_ttir(
-        fn,
-        real_ASTSource(
-            fn, constexprs=constants, signature=signature, attrs=attrs
-        ),
-        options=options,
-        codegen_fns=codegen_fns,
-        context=context,
-        module_map=backend.get_module_map(),
-    )
     ttir = str(module)
 
     compilation_result = compile_ttir_inplace(
@@ -522,7 +512,7 @@ def get_or_create_triton_kernel(
 
 
 def triton_kernel_call_lowering(
-    backend_init_func,
+    make_gpu_target_func,
     ctx,
     *array_args,
     fn,
@@ -645,7 +635,7 @@ def triton_kernel_call_lowering(
   kernel_calls = []
   for params in config_params:
     kernel, specialization_attr = get_or_create_triton_kernel(
-        backend_init_func,
+        make_gpu_target_func,
         ctx.module_context.platforms[0],
         fn,
         arg_dtypes,
@@ -720,13 +710,13 @@ def triton_kernel_call_lowering(
 
 mlir.register_lowering(
     triton_kernel_call_p,
-    functools.partial(triton_kernel_call_lowering, get_cuda_backend),
+    functools.partial(triton_kernel_call_lowering, make_gpu_target_cuda),
     platform="cuda",
 )
 
 mlir.register_lowering(
     triton_kernel_call_p,
-    functools.partial(triton_kernel_call_lowering, get_hip_backend),
+    functools.partial(triton_kernel_call_lowering, make_gpu_target_hip),
     platform="rocm",
 )
 
