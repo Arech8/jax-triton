@@ -615,6 +615,11 @@ def triton_kernel_call_lowering(
         "`kernel` must be a Triton `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner`."
     )
 
+  output2input = {v: k for k, v in input_output_aliases.items()}
+  assert len(output2input) == len(input_output_aliases), (
+    "input_output_aliases must be a bijection"
+  )
+
   outputs_offset = len(ctx.avals_in) + len(scalar_args)
   config_params = []
   for config in configs:
@@ -625,9 +630,13 @@ def triton_kernel_call_lowering(
     if callable(zeroed_outputs):
       config_zeroed_outputs = config_zeroed_outputs(config_metaparams)
 
+    # zeroed_params_with_sizes is a dict output_arg_idx -> aval_size_bytes
+    # config_zeroed_outputs is output ordinal numbers
     zeroed_params_with_sizes = {
-        i + outputs_offset: aval_size_bytes(ctx.avals_out[i])
-        for i in sorted(config_zeroed_outputs)
+      output2input[i] if i in output2input else i + outputs_offset: aval_size_bytes(
+        ctx.avals_out[i]
+      )
+      for i in sorted(config_zeroed_outputs)
     }
 
     config_params.append(
