@@ -4,20 +4,11 @@ import sys
 # from absl.testing import parameterized
 import pytest
 
-import jax
 import jax.numpy as jnp
-#from jax import config
 from jax import random
-import jax_triton as jt
 import numpy as np
-import triton
 
-# import triton.language as tl
-from triton.experimental import gluon
-from triton.experimental.gluon import language as gl
-# from triton.language.extra import libdevice
-
-from generic import get_arch, is_fp4_avail
+from generic import is_fp4_avail
 from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
 
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py

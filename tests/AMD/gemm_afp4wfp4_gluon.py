@@ -1,6 +1,6 @@
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/gluon/gemm_a8w8.py
-# Kernels are copypasted, launch function was rewritten to use JAX primitives and match
-# jax-triton calling conventions
+# Kernels are copypasted, the launch function was rewritten to use JAX primitives and
+# match jax-triton calling conventions
 
 import functools
 import json
@@ -9,7 +9,6 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 import jax_triton as jt
-import numpy as np
 import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
