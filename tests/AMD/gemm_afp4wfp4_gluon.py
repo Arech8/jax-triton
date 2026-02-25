@@ -13,21 +13,20 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from _aiter_pid_preprocessing import remap_xcd, pid_grid
-from _aiter_generic import AITER_TRITON_CONFIGS_PATH
-from generic import get_arch, is_fp4_avail
+import _aiter
+import arch_info
 
-
+global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
-# @triton.heuristics(
-#    {
-#        "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
-#        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
-#        and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
-#    }
-# )
+@triton.heuristics({
+  "EVEN_K": lambda args: (
+    (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
+    and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
+    and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0)
+  ),
+})
 @gluon.jit
 def _gemm_afp4wfp4_kernel(
   a_ptr,
@@ -76,7 +75,7 @@ def _gemm_afp4wfp4_kernel(
   # This is done in a grouped ordering to promote L2 data reuse.
   pid_unified = gl.program_id(axis=0)
   # remap so that XCDs get continous chunks of pids (of CHUNK_SIZE).
-  pid_unified = remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
+  pid_unified = _aiter.remap_xcd(pid_unified, GRID_MN * NUM_KSPLIT, NUM_XCDS=8)
 
   pid_k = pid_unified % NUM_KSPLIT
   pid = pid_unified // NUM_KSPLIT
@@ -84,7 +83,7 @@ def _gemm_afp4wfp4_kernel(
   num_pid_n = gl.cdiv(N, BLOCK_SIZE_N)
 
   if NUM_KSPLIT == 1:
-    pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
+    pid_m, pid_n = _aiter.pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
   else:
     pid_m = pid // num_pid_n
     pid_n = pid % num_pid_n
@@ -471,19 +470,22 @@ def _get_config(
   K: int,
 ):
   if not hasattr(_get_config, "_config_dict"):
-    dev = get_arch()
+    dev = arch_info.get_arch()
     if dev != "gfx950":
       raise ValueError(
         "Gluon implementation is not supported on this device (requires CDNA4)."
       )
-    fpath = f"{AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-AFP4WFP4.json"
+    fpath = f"{_aiter.AITER_TRITON_CONFIGS_PATH}/gemm/gluon/{dev}-GEMM-AFP4WFP4.json"
     with open(fpath, "r") as file:
       config = json.load(file)
     _get_config._config_dict = config
 
   return _get_config._config_dict["any"]
 
-@functools.partial(jax.jit, static_argnums=4)
+
+@functools.partial(
+  jax.jit, static_argnames=("dtype", "skip_reduce", "config"), donate_argnames="y"
+)
 def gemm_afp4wfp4(
   x: jnp.ndarray,
   w: jnp.ndarray,
@@ -504,7 +506,7 @@ def gemm_afp4wfp4(
           One scale per 32 elements in K dimension.
       w_scales (jnp.ndarray): E8M0 per-group scale for w with shape (N, K//32).
           One scale per 32 elements in K dimension.
-      dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
+      dtype (Optional[jnp.dtype]): Output datatype (jnp.bfloat16 or jnp.float16).
       y (Optional[jnp.ndarray]): Pre-allocated output tensor with shape (M, N).
       config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
           BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
@@ -514,7 +516,7 @@ def gemm_afp4wfp4(
       y (jnp.ndarray): Output with shape (M, N) or (SPK, M, N).
   """
 
-  assert is_fp4_avail(), "MXFP4 is not available on your device"
+  assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
   M, K = x.shape
   N, K = w.shape
@@ -543,9 +545,9 @@ def gemm_afp4wfp4(
 
   if not unit_NUM_KSPLIT:
     if _USE_GEMM_SPLITK_BF16:
-      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=dtype) #, device=x.device)
+      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=dtype)
     else:
-      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=jnp.float32)# , device=x.device)
+      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=jnp.float32)
 
     y_pp_stride = (y_pp.shape[1] * y_pp.shape[2], y_pp.shape[2], 1)
   else:
@@ -553,7 +555,7 @@ def gemm_afp4wfp4(
     y_pp_stride = None
 
   if y is None and (unit_NUM_KSPLIT or not skip_reduce):
-    y = jnp.empty((M, N), dtype=dtype) #, device=x.device)
+    y = jnp.empty((M, N), dtype=dtype)
 
   grid = lambda META: (  # noqa: E731
     (
@@ -624,7 +626,7 @@ def gemm_afp4wfp4(
       1,  # y.stride(1),
       kernel=_gemm_afp4wfp4_reduce_kernel,
       out_shape=jax.ShapeDtypeStruct(shape=y.shape, dtype=y.dtype),
-      input_output_aliases={0: 1},
+      input_output_aliases={1: 0},
       grid=grid_reduce,
       BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
       BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,

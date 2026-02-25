@@ -8,8 +8,9 @@ import jax.numpy as jnp
 from jax import random
 import numpy as np
 
-from generic import is_fp4_avail
+import arch_info
 from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
+from gemm_afp4wfp4_triton import gemm_afp4wfp4 as triton_gemm_afp4wfp4
 
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py
 
@@ -199,13 +200,9 @@ def run_triton(
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-# @pytest.mark.parametrize(
-#  "shuffle_weight_scales",
-#  [True, False],
-# )
+@pytest.mark.parametrize("shuffle_weight_scales", [False]) #  [True, False], )
 @pytest.mark.parametrize("skip_reduce", [True, False])
-# @pytest.mark.parametrize("impl", ["triton", "gluon"])
-@pytest.mark.parametrize("impl", ["gluon"])
+@pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
   M: int,
   N: int,
@@ -213,11 +210,12 @@ def test_gemm_afp4_wfp4(
   dtype,
   layout,
   output,
-  # shuffle_weight_scales,
+  shuffle_weight_scales,
   skip_reduce,
   impl,
 ):
-  if not is_fp4_avail():
+  del shuffle_weight_scales  # unused. Left for compatibility with the original test
+  if not arch_info.is_fp4_avail():
     pytest.skip("MXFP4 not supported on this architecture (requires CDNA4).")
 
   (
@@ -230,46 +228,27 @@ def test_gemm_afp4_wfp4(
     w_scales_triton,
     out_dtype,
     y,
-  ) = generate_gemm_afp4wfp4_inputs(
-    M,
-    N,
-    K,
-    dtype,
-    layout=layout,
-    output=output,
-  )
+  ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output)
 
   expected = jax_afp4wfp4(x, w, x_scales, w_scales, dtype)
 
-  # if impl == "triton":
-  #  impl = triton_gemm_afp4wfp4
-  # elif impl == "gluon":
-  if impl == "gluon":
+  if impl == "triton":
+    impl = triton_gemm_afp4wfp4
+  elif impl == "gluon":
     impl = gluon_gemm_afp4wfp4
   else:
     raise ValueError(f"Unknown implementation: {impl}")
 
-  if output:
-    triton_out = run_triton(
-      x,
-      w_triton,
-      x_scales_triton,
-      w_scales_triton,
-      dtype,
-      y,
-      skip_reduce=skip_reduce,
-      impl=impl,
-    )
-  else:
-    triton_out = run_triton(
-      x,
-      w_triton,
-      x_scales_triton,
-      w_scales_triton,
-      dtype,
-      skip_reduce=skip_reduce,
-      impl=impl,
-    )
+  triton_out = run_triton(
+    x,
+    w_triton,
+    x_scales_triton,
+    w_scales_triton,
+    dtype,
+    y,
+    skip_reduce=skip_reduce,
+    impl=impl,
+  )
 
   if triton_out.ndim == 3:
     triton_out = triton_out.sum(axis=0).astype(dtype)

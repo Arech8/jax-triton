@@ -1,9 +1,7 @@
 from benchstats import qbench as qb
 from benchstats.render import makeReadable
 from collections.abc import Callable
-import functools
-from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
-from generic import get_arch, is_fp4_avail
+from generic import is_fp4_avail
 import jax
 import jax.numpy as jnp
 import jax.random as random
@@ -28,6 +26,28 @@ def register_benchmark_set(f: Callable) -> Callable:
   name = name_parts[1:-1]
   benchmark_sets["_".join(name)] = f
   return f
+
+
+@register_benchmark_set
+def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
+  if not is_fp4_avail():
+    return {}
+
+  from gemm_afp4wfp4_test import generate_gemm_afp4wfp4_inputs
+  from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
+
+  def init(M, N, K, dtype, layout="TN", output=True, skip_reduce=False) -> list:
+    (x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, y) = (
+      generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output)
+    )
+    return [x, w_triton, x_scales_triton, w_scales_triton, dtype, y, None, skip_reduce]
+
+  # fmt:off
+  return {
+    "gemm_afp4wfp4 no_output": (lambda: init(320, 8192, 1024, jnp.bfloat16, output=False), gluon_gemm_afp4wfp4),
+    "gemm_afp4wfp4 output": (lambda: init(320, 8192, 1024, jnp.bfloat16, output=True), gluon_gemm_afp4wfp4),
+  }
+  # fmt:on
 
 
 @triton.jit
@@ -269,8 +289,8 @@ def main(enabled=[]):
   assert len(bms) > 0, "No benchmark sets were enabled, shouildn't be here"
 
   bm_names, alt_delimiter = names_to_comparisons(tuple(bms.keys()))
-  all_bms = "\", \"".join(bm_names)
-  print(f"Going to benchmark the following sets: \"{all_bms}\"")
+  all_bms = '", "'.join(bm_names)
+  print(f'Going to benchmark the following sets: "{all_bms}"')
 
   results = get_benchmark_results(bms, iters=100, reps=10)
   qb.showBench(
