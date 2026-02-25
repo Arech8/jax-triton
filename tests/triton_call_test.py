@@ -67,8 +67,10 @@ def add_inplace_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr, INPLA
 def add(x, y, *, kernel=add_kernel, **kwargs):
   if kernel is add_kernel or kernel is add_inplace_kernel:
     kwargs.setdefault("BLOCK_SIZE", 8)
-    if kernel is add_inplace_kernel:
-      kwargs.setdefault("INPLACE_Y", False)
+  if kernel is add_inplace_kernel or (  # handling autotuner & possibly other wrappers
+    hasattr(kernel, "fn") and kernel.fn is add_inplace_kernel
+  ):
+    kwargs.setdefault("INPLACE_Y", False)
 
   default_grid = lambda meta: triton.cdiv(x.size, meta["BLOCK_SIZE"])
   return jt.triton_call(

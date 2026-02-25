@@ -435,6 +435,18 @@ def get_or_create_triton_kernel(
   kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
 
   if kernel is None:
+    # at first, check if the number of params in the kernel signature matches the
+    # reconstucted signature. Mismatch could happen due to differences in
+    # `triton_call(input_output_aliases=)` handling in the current and old jax-triton
+    assert len(fn.signature.parameters) == len(signature), (
+      f"Number of parameters in the kernel '{fn}' signature "
+      f"({len(fn.signature.parameters)}: {fn.signature}) "
+      f"does not match reconstucted signature ({len(signature)}: {signature}). "
+      "If the kernel was working on an older version of jax-triton and its "
+      "triton_call() launcher uses `input_output_aliases` argument, note that "
+      "implicit output arguments are no longer required for aliased args."
+    )
+
     opts = {
         "num_warps": num_warps,
         "num_stages": num_stages,
