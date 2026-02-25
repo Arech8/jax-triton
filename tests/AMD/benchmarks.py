@@ -10,11 +10,24 @@ import jax.random as random
 import jax_triton as jt
 import numpy as np
 from rich.progress import Progress
+import sys
 import time
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+
+benchmark_sets: dict[str, Callable] = {}
+
+
+def register_benchmark_set(f: Callable) -> Callable:
+  name_parts = f.__name__.split("_", maxsplit=-1)
+  assert len(name_parts) >= 3
+  assert name_parts[0] == "make" and name_parts[-1] == "benchmark"
+  name = name_parts[1:-1]
+  benchmark_sets["_".join(name)] = f
+  return f
 
 
 @triton.jit
@@ -29,7 +42,8 @@ def copy_scalar_gluon(in_ptr, out_ptr):
   gl.store(out_ptr, value)
 
 
-def make_startup_costs_benchmark() -> dict[str, tuple[Callable, Callable]]:
+@register_benchmark_set
+def make_startup_benchmark() -> dict[str, tuple[Callable, Callable]]:
   """
   Prepares benchmarking startup costs of triton vs gluon kernels.
 
@@ -231,14 +245,32 @@ def get_benchmark_results(
   return results
 
 
-def main():
+def main(enabled=[]):
   # jax.config.update("jax_enable_x64", True)
   start = time.perf_counter_ns()
 
-  bms_startup = make_startup_costs_benchmark()
+  if not enabled:
+    enabled = benchmark_sets.keys()
 
-  bms = bms_startup
+  if len(frozenset(enabled)) != len(enabled):
+    raise ValueError("Benchmark set names must be unique")
+
+  bms = {}
+  for bm_id in enabled:
+    if bm_id not in benchmark_sets:
+      raise ValueError(
+        f"Benchmark {bm_id} not found, available benchmark sets are: {', '.join(benchmark_sets.keys())}"
+      )
+
+    b = benchmark_sets[bm_id]()
+    assert frozenset(b.keys()) not in bms, "Some benchmark ids are colliding!"
+    bms.update(b)
+
+  assert len(bms) > 0, "No benchmark sets were enabled, shouildn't be here"
+
   bm_names, alt_delimiter = names_to_comparisons(tuple(bms.keys()))
+  all_bms = "\", \"".join(bm_names)
+  print(f"Going to benchmark the following sets: \"{all_bms}\"")
 
   results = get_benchmark_results(bms, iters=100, reps=10)
   qb.showBench(
@@ -253,4 +285,4 @@ def main():
 
 
 if __name__ == "__main__":
-  main()
+  main(sys.argv[1:])
