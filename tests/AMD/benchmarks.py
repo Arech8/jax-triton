@@ -1,19 +1,22 @@
+from collections.abc import Callable
+import itertools
+import sys
+import time
+
 from benchstats import qbench as qb
 from benchstats.render import makeReadable
-from collections.abc import Callable
-from generic import is_fp4_avail
 import jax
 import jax.numpy as jnp
 import jax.random as random
 import jax_triton as jt
 import numpy as np
 from rich.progress import Progress
-import sys
-import time
 import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+
+import arch_info
 
 
 benchmark_sets: dict[str, Callable] = {}
@@ -30,11 +33,15 @@ def register_benchmark_set(f: Callable) -> Callable:
 
 @register_benchmark_set
 def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
-  if not is_fp4_avail():
+  if not arch_info.is_fp4_avail():
+    print(
+      "MXFP4 not supported on this architecture (requires CDNA4). Skipping gemm_afp4wfp4 benchmarks."
+    )
     return {}
 
   from gemm_afp4wfp4_test import generate_gemm_afp4wfp4_inputs
   from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
+  from gemm_afp4wfp4_triton import gemm_afp4wfp4 as triton_gemm_afp4wfp4
 
   def init(M, N, K, dtype, layout="TN", output=True, skip_reduce=False) -> list:
     (x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, y) = (
@@ -42,12 +49,65 @@ def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
     )
     return [x, w_triton, x_scales_triton, w_scales_triton, dtype, y, None, skip_reduce]
 
-  # fmt:off
-  return {
-    "gemm_afp4wfp4 no_output": (lambda: init(320, 8192, 1024, jnp.bfloat16, output=False), gluon_gemm_afp4wfp4),
-    "gemm_afp4wfp4 output": (lambda: init(320, 8192, 1024, jnp.bfloat16, output=True), gluon_gemm_afp4wfp4),
-  }
-  # fmt:on
+  def instantiate_config(m_n_k, dtype, layout, output, skip_reduce, is_gluon):
+    return lambda: init(
+      *m_n_k, dtype, layout=layout, output=output, skip_reduce=skip_reduce
+    )
+
+  def make_benchmarks(cfg):
+    return {
+      f"gemm_afp4wfp4({m_n_k[0]},{m_n_k[1]},{m_n_k[2]},{dtype.__name__},{layout},"
+      f"{'output' if output else 'no_output'},{'skip' if skip_reduce else 'no_skip'}) {'gluon' if is_gluon else 'triton'}": (
+        instantiate_config(m_n_k, dtype, layout, output, skip_reduce, is_gluon),
+        gluon_gemm_afp4wfp4 if is_gluon else triton_gemm_afp4wfp4,
+      )
+      for m_n_k, dtype, layout, output, skip_reduce, is_gluon in cfg
+    }
+
+  # gluon kernel config is optimized for M=N=K=8192, so to compare apples to apples,
+  # trying values around that
+  drop_similar = True  # don't benchmark configs yielding not much different results
+
+  ret = make_benchmarks(
+    itertools.product(
+      [
+        (8192, 8192, 8192),
+      ],
+      [jnp.bfloat16] if drop_similar else [jnp.bfloat16, jnp.float16],
+      ["TN"] if drop_similar else ["TN", "TT", "NN", "NT"],
+      [False] if drop_similar else [True, False],
+      [False] if drop_similar else [True, False],
+      [True, False],  # is_gluon
+    )
+  )
+  ret.update(
+    make_benchmarks(
+      itertools.product(
+        [
+          (4 * 8192, 4 * 8192, 4 * 8192),
+          (8192 // 2, 8192 // 2, 8192 // 2),
+          (8192 // 4, 8192 // 4, 8192 // 4),
+          (4 * 8192, 8192, 4 * 8192),
+          (8192, 4 * 8192, 8192),
+          (8192 // 2, 8192 * 2, 8192 // 2),
+          (8192 // 4, 8192 * 4, 8192 // 4),
+          (8192 * 4, 8192 // 4, 8192 * 4),
+          (4864, 8192, 4160),
+          (16, 16384, 3328 * 2),
+          # (128, 16384, 3328 * 2),
+          (256, 256, 256),
+          (256, 8192, 256),
+          (1, 1, 32),
+        ],
+        [jnp.bfloat16],  # [jnp.bfloat16, jnp.float16],
+        ["TN"],  # ["TN", "TT", "NN", "NT"],
+        [False],  # [True, False],
+        [False],  # [True, False],
+        [True, False],  # is_gluon
+      )
+    )
+  )
+  return ret
 
 
 @triton.jit
@@ -290,7 +350,7 @@ def main(enabled=[]):
 
   bm_names, alt_delimiter = names_to_comparisons(tuple(bms.keys()))
   all_bms = '", "'.join(bm_names)
-  print(f'Going to benchmark the following sets: "{all_bms}"')
+  print(f'Going run {len(bm_names)} benchmarks: "{all_bms}"')
 
   results = get_benchmark_results(bms, iters=100, reps=10)
   qb.showBench(
