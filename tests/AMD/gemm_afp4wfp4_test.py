@@ -26,25 +26,28 @@ def generate_gemm_afp4wfp4_inputs(
   dtype,
   layout="TN",
   output=True,
+  key = random.key(5),
 ):
   assert not isinstance(dtype, str)
 
-  k = random.key(5)
+  def randint(key, shape, min, max, dtype):
+    key, k = random.split(key)
+    return key, random.randint(k, shape, min, max, dtype=dtype)
 
   if layout[0] == "T":
     # 34 is two packed e2m1 values 0010 which is 1.0.
-    x_low = random.randint(k, (M, K // 2), 0, 16, dtype=jnp.uint8)
-    x_high = random.randint(k, (M, K // 2), 0, 16, dtype=jnp.uint8)
+    key, x_low = randint(key, (M, K // 2), 0, 16, dtype=jnp.uint8)
+    key, x_high = randint(key, (M, K // 2), 0, 16, dtype=jnp.uint8)
   else:
-    x_low = random.randint(k, (K // 2, M), 0, 16, dtype=jnp.uint8).T
-    x_high = random.randint(k, (K // 2, M), 0, 16, dtype=jnp.uint8).T
+    key, x_low = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8).T
+    key, x_high = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8).T
 
   if layout[1] == "N":
-    w_low = random.randint(k, (N, K // 2), 0, 16, dtype=jnp.uint8)
-    w_high = random.randint(k, (N, K // 2), 0, 16, dtype=jnp.uint8)
+    key, w_low = randint(key, (N, K // 2), 0, 16, dtype=jnp.uint8)
+    key, w_high = randint(key, (N, K // 2), 0, 16, dtype=jnp.uint8)
   else:
-    w_low = random.randint(k, (K // 2, N), 0, 16, dtype=jnp.uint8).T
-    w_high = random.randint(k, (K // 2, N), 0, 16, dtype=jnp.uint8).T
+    key, w_low = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8).T
+    key, w_high = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8).T
 
   # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
   x = x_high << 4 | x_low
@@ -53,10 +56,10 @@ def generate_gemm_afp4wfp4_inputs(
   w = w_low | w_high << 4
   # Scale of 1.0 in e8m0, bias 127.
   M_pad = (M + 255) // 256 * 256
-  x_scales = random.randint(
-    k, (K // SCALE_GROUP_SIZE, M_pad), 124, 128, dtype=jnp.uint8
+  key, x_scales = randint(
+    key, (K // SCALE_GROUP_SIZE, M_pad), 124, 128, dtype=jnp.uint8
   )
-  w_scales = random.randint(k, (K // SCALE_GROUP_SIZE, N), 124, 128, dtype=jnp.uint8)
+  key, w_scales = randint(key, (K // SCALE_GROUP_SIZE, N), 124, 128, dtype=jnp.uint8)
   x_scales = x_scales.T
   w_scales = w_scales.T
 

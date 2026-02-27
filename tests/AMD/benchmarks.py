@@ -43,9 +43,13 @@ def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
   from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
   from gemm_afp4wfp4_triton import gemm_afp4wfp4 as triton_gemm_afp4wfp4
 
+  k = jax.random.key(42)
+
   def init(M, N, K, dtype, layout="TN", output=True, skip_reduce=False) -> list:
+    nonlocal k
+    k, s = jax.random.split(k)
     (x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, y) = (
-      generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output)
+      generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output, key=s)
     )
     return [x, w_triton, x_scales_triton, w_scales_triton, dtype, y, None, skip_reduce]
 
@@ -183,15 +187,21 @@ def make_startup_benchmark() -> dict[str, tuple[Callable, Callable]]:
   def init_scalar() -> list:
     return [jnp.array(42.314)]
 
+  k = jax.random.key(42)
+
   def init_vec() -> list:
     # even though the kernel shouldn't be data dependent, it's noticiably slower on
     # a random data (jax.block_until_ready() is accounted for)
-    return [random.randint(random.key(42), (NGigs * 1024 * 1024 * 1024,), 0, 1000000)]
+    nonlocal k
+    k, sk = jax.random.split(k)
+    return [random.randint(sk, (NGigs * 1024 * 1024 * 1024,), 0, 1000000)]
     # return [jnp.arange(NGigs * 1024 * 1024 * 1024)]
 
   def init_vec_out() -> list:
-    i = random.randint(random.key(42), (NGigs * 1024 * 1024 * 1024,), 0, 1000000)
     # i = jnp.arange(NGigs * 1024 * 1024 * 1024)
+    nonlocal k
+    k, sk = jax.random.split(k)
+    i = random.randint(sk, (NGigs * 1024 * 1024 * 1024,), 0, 1000000)
     return [i, jnp.empty_like(i)]
 
   # fmt: off

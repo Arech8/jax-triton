@@ -1,4 +1,4 @@
-# based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/gluon/gemm_a8w8.py
+# based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/gluon/gemm_afp4wfp4.py
 # Kernels are copypasted, the launch function was rewritten to use JAX primitives and
 # match jax-triton calling conventions
 
