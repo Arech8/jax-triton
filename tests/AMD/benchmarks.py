@@ -391,13 +391,10 @@ def main(
       else:
         fname_base = f
         break
-    
-    results_fname = f"{fname_base[:-4]}.npy"
 
     console = LoggingConsole(record=True)
   else:
     fname_base = None
-    results_fname = None
     console = LoggingConsole()
 
   bms = {}
@@ -449,9 +446,14 @@ def main(
 
   if fname_base is not None:
     console.save_svg(fname_base)
-    print(f"Saved SVG to {fname_base}")
-    np.save(results_fname, results)
-    print(f"Saved results to {results_fname}")
+
+    fname_base = f"{fname_base[:-4]}.txt"
+    console.save_svg(fname_base)
+
+    fname_base = f"{fname_base[:-4]}.npy"
+    np.save(fname_base, results)
+
+    print(f"Saved results to {fname_base[:-4]}")
 
 
 if __name__ == "__main__":

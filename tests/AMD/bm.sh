@@ -8,10 +8,12 @@ N_TRIES=3
 
 OLD="${FILES_PFX}*.svg"
 OLD_NPY="${FILES_PFX}*.npy"
+OLD_TXT="${FILES_PFX}*.txt"
 
 set -x
 rm $OLD
 rm $OLD_NPY
+rm $OLD_TXT
 [ ! -d $DUMP_DIR ] && mkdir -p $DUMP_DIR
 
 # custom vs normal runner on gemms only
@@ -43,5 +45,7 @@ for (( i=0 ; i < $N_TRIES ; i++ )) do
     python benchmarks.py ${CUST_PRMS} --no-randomize_iterations --random_inputs
     python benchmarks.py ${CUST_PRMS} --no-randomize_iterations --no-random_inputs
 done
+
+zip -r ${FILES_PFX}.zip ${FILES_PFX}*.svg ${FILES_PFX}*.npy ${FILES_PFX}*.txt
 
 set +x
