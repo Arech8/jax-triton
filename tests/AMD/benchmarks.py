@@ -1,9 +1,11 @@
+import argparse
 from collections.abc import Callable
 import itertools
-import sys
+import os
 import time
 
 from benchstats import qbench as qb
+from benchstats.common import LoggingConsole
 from benchstats.render import makeReadable
 import jax
 import jax.numpy as jnp
@@ -20,6 +22,9 @@ import arch_info
 
 
 benchmark_sets: dict[str, Callable] = {}
+
+_single_gemm: bool = False
+_random_inputs: bool = True
 
 
 def register_benchmark_set(f: Callable) -> Callable:
@@ -47,7 +52,10 @@ def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
 
   def init(M, N, K, dtype, layout="TN", output=True, skip_reduce=False) -> list:
     nonlocal k
-    k, s = jax.random.split(k)
+    if _random_inputs:
+      k, s = jax.random.split(k)
+    else:
+      s = k
     (x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, y) = (
       generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output, key=s)
     )
@@ -84,33 +92,34 @@ def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
       [True, False],  # is_gluon
     )
   )
-  ret.update(
-    make_benchmarks(
-      itertools.product(
-        [
-          (4 * 8192, 4 * 8192, 4 * 8192),
-          (8192 // 2, 8192 // 2, 8192 // 2),
-          (8192 // 4, 8192 // 4, 8192 // 4),
-          (4 * 8192, 8192, 4 * 8192),
-          (8192, 4 * 8192, 8192),
-          (8192 // 2, 8192 * 2, 8192 // 2),
-          (8192 // 4, 8192 * 4, 8192 // 4),
-          (8192 * 4, 8192 // 4, 8192 * 4),
-          (4864, 8192, 4160),
-          (16, 16384, 3328 * 2),
-          # (128, 16384, 3328 * 2),
-          (256, 256, 256),
-          (256, 8192, 256),
-          (1, 1, 32),
-        ],
-        [jnp.bfloat16],  # [jnp.bfloat16, jnp.float16],
-        ["TN"],  # ["TN", "TT", "NN", "NT"],
-        [False],  # [True, False],
-        [False],  # [True, False],
-        [True, False],  # is_gluon
+  if not _single_gemm:
+    ret.update(
+      make_benchmarks(
+        itertools.product(
+          [
+            (4 * 8192, 4 * 8192, 4 * 8192),
+            (8192 // 2, 8192 // 2, 8192 // 2),
+            (8192 // 4, 8192 // 4, 8192 // 4),
+            (4 * 8192, 8192, 4 * 8192),
+            (8192, 4 * 8192, 8192),
+            (8192 // 2, 8192 * 2, 8192 // 2),
+            (8192 // 4, 8192 * 4, 8192 // 4),
+            (8192 * 4, 8192 // 4, 8192 * 4),
+            (4864, 8192, 4160),
+            (16, 16384, 3328 * 2),
+            # (128, 16384, 3328 * 2),
+            (256, 256, 256),
+            (256, 8192, 256),
+            (1, 1, 32),
+          ],
+          [jnp.bfloat16],  # [jnp.bfloat16, jnp.float16],
+          ["TN"],  # ["TN", "TT", "NN", "NT"],
+          [False],  # [True, False],
+          [False],  # [True, False],
+          [True, False],  # is_gluon
+        )
       )
     )
-  )
   return ret
 
 
@@ -193,15 +202,18 @@ def make_startup_benchmark() -> dict[str, tuple[Callable, Callable]]:
     # even though the kernel shouldn't be data dependent, it's noticiably slower on
     # a random data (jax.block_until_ready() is accounted for)
     nonlocal k
-    k, sk = jax.random.split(k)
-    return [random.randint(sk, (NGigs * 1024 * 1024 * 1024,), 0, 1000000)]
-    # return [jnp.arange(NGigs * 1024 * 1024 * 1024)]
+    if _random_inputs:
+      k, sk = jax.random.split(k)
+      return [random.randint(sk, (NGigs * 1024 * 1024 * 1024,), 0, 1000000)]
+    return [jnp.arange(NGigs * 1024 * 1024 * 1024)]
 
   def init_vec_out() -> list:
-    # i = jnp.arange(NGigs * 1024 * 1024 * 1024)
     nonlocal k
-    k, sk = jax.random.split(k)
-    i = random.randint(sk, (NGigs * 1024 * 1024 * 1024,), 0, 1000000)
+    if _random_inputs:
+      k, sk = jax.random.split(k)
+      i = random.randint(sk, (NGigs * 1024 * 1024 * 1024,), 0, 1000000)
+    else:
+      i = jnp.arange(NGigs * 1024 * 1024 * 1024)
     return [i, jnp.empty_like(i)]
 
   # fmt: off
@@ -277,6 +289,7 @@ def get_benchmark_results(
   iters: int = 100,
   reps: int = 10,
   warmup: int = 3,
+  randomize_iterations: bool = True,
   show_progress: bool = True,
 ) -> np.ndarray:
   n_bms = len(bms)
@@ -311,7 +324,8 @@ def get_benchmark_results(
       progress.update(iter_task, completed=0)
     for i in range(iters):
       # reshuffling the order of bm invocation to break HW dependencies
-      rng.shuffle(bm_idxs)
+      if randomize_iterations:
+        rng.shuffle(bm_idxs)
       for bm_idx in bm_idxs:
         init_func, bm_func = funcs[bm_idx]
         inputs = init_func()
@@ -335,15 +349,56 @@ def get_benchmark_results(
   return results
 
 
-def main(enabled=[]):
+def main(
+  enabled: list[str] | None = None,
+  iters: int = 100,
+  reps: int = 10,
+  single_gemm: bool = False,
+  custom_runner: bool = True,
+  random_inputs: bool = True,
+  randomize_iterations: bool = True,
+  dump_pfx: str | None = None,
+):
+  global _single_gemm, _random_inputs
+  _single_gemm = single_gemm
+  _random_inputs = random_inputs
+
   # jax.config.update("jax_enable_x64", True)
   start = time.perf_counter_ns()
 
   if not enabled:
-    enabled = benchmark_sets.keys()
+    enabled = list(benchmark_sets.keys())
 
   if len(frozenset(enabled)) != len(enabled):
     raise ValueError("Benchmark set names must be unique")
+
+  if dump_pfx:
+    enabled_str = "-".join(enabled)
+    fname_base = (
+      f"{dump_pfx}_{enabled_str}"
+      f"_i{iters}_r{reps}"
+      + ("_SG" if single_gemm else "")
+      +("_CR" if custom_runner else "")
+      + ("" if random_inputs else "_NR-I")
+      + ("" if randomize_iterations else "_NR-IT")
+      + "_"
+    )
+    c = 0
+    while True:
+      f = f"{fname_base}{c}.svg"
+      if os.path.exists(f):
+        c += 1
+      else:
+        fname_base = f
+        break
+    
+    results_fname = f"{fname_base[:-4]}.npy"
+
+    console = LoggingConsole(record=True)
+  else:
+    fname_base = None
+    results_fname = None
+    console = LoggingConsole()
 
   bms = {}
   for bm_id in enabled:
@@ -362,17 +417,74 @@ def main(enabled=[]):
   all_bms = '", "'.join(bm_names)
   print(f'Going run {len(bm_names)} benchmarks: "{all_bms}"')
 
-  results = get_benchmark_results(bms, iters=100, reps=10)
-  qb.showBench(
-    results,
-    bm_names,
-    alt_delimiter,
-    metrics={"mean": np.mean, "median": np.median, "min": np.min},
-  )
+  metrics = {"mean": np.mean, "median": np.median, "min": np.min}
+
+  if custom_runner:
+    results = get_benchmark_results(
+      bms, iters=iters, reps=reps, warmup=2, randomize_iterations=randomize_iterations,
+    )
+    qb.showBench(
+      results,
+      bm_names=bm_names,
+      alt_delimiter=alt_delimiter,
+      metrics=metrics,
+      console=console,
+    )
+  else:
+    _, results = qb.benchmark(
+      list(bms.values()),
+      bm_names=bm_names,
+      alt_delimiter=alt_delimiter,
+      metrics=metrics,
+      iters=iters,
+      reps=reps,
+      warmup=2,
+      randomize_iterations=randomize_iterations,
+      wait_complete=jax.block_until_ready,
+      console=console,
+    )
 
   end = time.perf_counter_ns()
-  print(f"Done in {makeReadable((end - start) * 1e-9, 1)}s")
+  console.print(f"Done in {makeReadable((end - start) * 1e-9, 1)}s")
+
+  if fname_base is not None:
+    console.save_svg(fname_base)
+    print(f"Saved SVG to {fname_base}")
+    np.save(results_fname, results)
+    print(f"Saved results to {results_fname}")
 
 
 if __name__ == "__main__":
-  main(sys.argv[1:])
+  parser = argparse.ArgumentParser(
+    description="Run triton/gluon benchmarks",
+  )
+  parser.add_argument(
+    "benchmarks", nargs="*", default=None,
+    help=f"Benchmark sets to run. Available: {', '.join(benchmark_sets.keys())}. Default: all.",
+  )
+  parser.add_argument("--iters", type=int, default=100,
+                      help="Iterations per repetition (default: 100)")
+  parser.add_argument("--reps", type=int, default=10,
+                      help="Number of repetitions (default: 10)")
+  parser.add_argument("--single_gemm", action=argparse.BooleanOptionalAction, default=False,
+                      help="Only benchmark the base gemm size (default: False)")
+  parser.add_argument("--custom_runner", action=argparse.BooleanOptionalAction, default=True,
+                      help="Use custom benchmark runner vs qb.benchmark() (default: True)")
+  parser.add_argument("--random_inputs", action=argparse.BooleanOptionalAction, default=True,
+                      help="Use random input data vs deterministic arange (default: True)")
+  parser.add_argument("--randomize_iterations", action=argparse.BooleanOptionalAction, default=True,
+                      help="Shuffle benchmark order within iterations (default: True)")
+  parser.add_argument("--dump_pfx", type=str, default=None,
+                      help="Filename prefix for SVG/HTML export of console output")
+
+  args = parser.parse_args()
+  main(
+    enabled=args.benchmarks or None,
+    iters=args.iters,
+    reps=args.reps,
+    single_gemm=args.single_gemm,
+    custom_runner=args.custom_runner,
+    random_inputs=args.random_inputs,
+    randomize_iterations=args.randomize_iterations,
+    dump_pfx=args.dump_pfx,
+  )
