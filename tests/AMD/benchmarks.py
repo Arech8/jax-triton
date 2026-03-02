@@ -341,7 +341,7 @@ def run_benchmarks(
   )
   if jax.local_device_count() > 1:
     console.warning(
-      "More than 1 device is visible. For potentially better results consistency, restrict the number of devices using HIP_VISIBLE_DEVICES or similar environment variable."
+      "More than 1 device is visible. For potentially better results consistency, restrict the number of devices using ROCR_VISIBLE_DEVICES or similar environment variable."
     )
 
   _, results = qb.benchmark(
