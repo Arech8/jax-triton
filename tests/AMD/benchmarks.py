@@ -20,6 +20,96 @@ from triton.experimental.gluon import language as gl
 import arch_info
 
 
+@qb.registerBenchmark
+def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
+
+  @gluon.jit
+  def atomic_add_gluon(
+    counter_ptr, values_ptr, n_elements, BLOCK_SIZE: gl.constexpr, layout: gl.constexpr
+  ):
+    for i in range(1000):
+      pid = gl.program_id(0)
+      offsets = pid * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
+      mask = offsets < n_elements
+      values = gl.load(values_ptr + offsets, mask=mask)
+      counter_ptrs = counter_ptr + gl.zeros([BLOCK_SIZE], dtype=gl.int32, layout=layout)
+      gl.atomic_add(counter_ptrs, values, mask=mask)
+
+  @triton.jit
+  def atomic_add_triton(counter_ptr, values_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    for i in range(1000):
+      pid = tl.program_id(0)
+      offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+      mask = offsets < n_elements
+      values = tl.load(values_ptr + offsets, mask=mask)
+      # Splat counter_ptr into a tensor of identical pointers
+      counter_ptrs = counter_ptr + tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+      tl.atomic_add(counter_ptrs, values, mask=mask)
+
+  @partial(jax.jit, donate_argnames="counter", static_argnums=(2,))
+  def run_gluon(counter, values, num_warps: int = 16):
+    assert values.size == 256 * 1024
+    assert counter.size == 1 and counter.ndim == 1
+    layout = gl.BlockedLayout(
+      size_per_thread=[1],
+      threads_per_warp=[64],
+      warps_per_cta=[num_warps],
+      order=[0],
+    )
+    BLOCK_SIZE = num_warps * 64
+    return jt.triton_call(
+      counter,
+      values,
+      values.size,
+      kernel=atomic_add_gluon,
+      out_shape=counter,
+      grid=(triton.cdiv(values.size, BLOCK_SIZE),),
+      num_warps=num_warps,
+      input_output_aliases={0: 0},
+      BLOCK_SIZE=BLOCK_SIZE,
+      layout=layout,
+    )
+
+  @partial(jax.jit, donate_argnames="counter", static_argnums=(2,))
+  def run_triton(counter, values, num_warps: int = 16):
+    assert values.size == 256 * 1024
+    assert counter.size == 1 and counter.ndim == 1
+    BLOCK_SIZE = num_warps * 64
+    return jt.triton_call(
+      counter,
+      values,
+      values.size,
+      kernel=atomic_add_triton,
+      out_shape=counter,
+      grid=(triton.cdiv(values.size, BLOCK_SIZE),),
+      num_warps=num_warps,
+      input_output_aliases={0: 0},
+      BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+  # test (remove for range before enabling)
+  if False:
+    c_g = jnp.zeros((1,), dtype=jnp.float32)
+    c_t = jnp.zeros((1,), dtype=jnp.float32)
+    values = jnp.arange(256 * 1024, dtype=jnp.float32)
+    c_g = run_gluon(c_g, values)
+    c_t = run_triton(c_t, values)
+    print(f"c_g: {c_g}, c_t: {c_t}")
+    assert c_g == c_t and c_g == values.sum()
+
+  def init(n: int, dtype):
+    return [jnp.zeros((1,), dtype=dtype), jnp.ones(n, dtype=dtype)]
+
+  return {
+    f"atomic_add(262144 uint32)|gluon": (run_gluon, partial(init, 262144, jnp.uint32)),
+    f"atomic_add(262144 uint32)|triton": (run_triton, partial(init, 262144, jnp.uint32)),
+    f"atomic_add(262144 int32)|gluon": (run_gluon, partial(init, 262144, jnp.int32)),
+    f"atomic_add(262144 int32)|triton": (run_triton, partial(init, 262144, jnp.int32)),
+    f"atomic_add(262144 float32)|gluon": (run_gluon, partial(init, 262144, jnp.float32)),
+    f"atomic_add(262144 float32)|triton": (run_triton, partial(init, 262144, jnp.float32)),
+  }
+
+
 ######################################################################  gemm_afp4wfp4
 
 
