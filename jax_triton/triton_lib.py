@@ -54,6 +54,9 @@ try:
   import triton._C.libtriton as _triton
   import triton.backends.nvidia.compiler as cb
 
+  import triton.experimental.gluon._runtime as gl_runtime
+  from triton.experimental.gluon import language as gl
+
   CAN_USE_TRITON = True
 except ModuleNotFoundError:
   pass
@@ -116,7 +119,7 @@ def avals_to_layouts(avals):
 def get_triton_type(obj: Any) -> str:
   if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
     return f"*{_JAX_TO_TRITON_TYPE_MAP[obj.dtype]}"
-  if isinstance(obj, tl.constexpr):
+  if isinstance(obj, (tl.constexpr, gl.constexpr)):
     obj = obj.value
   if isinstance(obj, bool):  # True == isinstance(True, int) !!!
     return "B"
@@ -161,10 +164,8 @@ def aval_size_bytes(aval):
   return np.dtype(aval.dtype).itemsize * aval.size
 
 
-def get_cuda_backend(device, compute_capability):
-  target = cb.GPUTarget("cuda", compute_capability, 32)
-  backend = cb.CUDABackend(target)
-  return backend
+def make_gpu_target_cuda(device, compute_capability):
+  return cb.GPUTarget("cuda", compute_capability, 32)
 
 
 _IS_HIPBackend_PATCHED = False
@@ -200,15 +201,13 @@ def _patch_hip_backend():
     hb.HIPBackend.is_within_2gb = fixed_is_within_2gb
 
 
-def get_hip_backend(device, compute_capability):
+def make_gpu_target_hip(device, compute_capability):
   # TODO(Arech): remove _patch_hip_backend() once Triton releases a fix
   _patch_hip_backend()
 
   arch = triton_kernel_call_lib.get_arch_details(device)
   arch = arch.split(":")[0]
-  target = hb.GPUTarget("hip", arch, 64)
-  backend = hb.HIPBackend(target)
-  return backend
+  return hb.GPUTarget("hip", arch, 64)
 
 
 @dataclasses.dataclass
@@ -359,7 +358,7 @@ _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
 
 
 def get_or_create_triton_kernel(
-    backend_init_func,
+    make_gpu_target_func,
     platform,
     fn,
     arg_dtypes,
@@ -386,7 +385,8 @@ def get_or_create_triton_kernel(
   if num_ctas > 1 and compute_capability < 90:
     raise ValueError("num_ctas > 1 unsupported before Hopper.")
 
-  backend = backend_init_func(device, compute_capability)
+  gpu_target = make_gpu_target_func(device, compute_capability)
+  backend = triton.compiler.make_backend(gpu_target)
 
   signature = {fn.arg_names[i]: v for i, v in enumerate(arg_dtypes)}
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
@@ -435,6 +435,18 @@ def get_or_create_triton_kernel(
   kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
 
   if kernel is None:
+    # at first, check if the number of params in the kernel signature matches the
+    # reconstucted signature. Mismatch could happen due to differences in
+    # `triton_call(input_output_aliases=)` handling in the current and old jax-triton
+    assert len(fn.signature.parameters) == len(signature), (
+      f"Number of parameters in the kernel '{fn}' signature "
+      f"({len(fn.signature.parameters)}: {fn.signature}) "
+      f"does not match reconstucted signature ({len(signature)}: {signature}). "
+      "If the kernel was working on an older version of jax-triton and its "
+      "triton_call() launcher uses `input_output_aliases` argument, note that "
+      "implicit output arguments are no longer required for aliased args."
+    )
+
     opts = {
         "num_warps": num_warps,
         "num_stages": num_stages,
@@ -458,16 +470,15 @@ def get_or_create_triton_kernel(
     backend.load_dialects(context)
     codegen_fns = backend.get_codegen_implementation(options)
 
-    module = code_gen.ast_to_ttir(
-        fn,
-        tc.ASTSource(
-            fn, constexprs=constants, signature=signature, attrs=attrs
-        ),
-        options=options,
-        codegen_fns=codegen_fns,
-        context=context,
-        module_map=backend.get_module_map(),
+    real_ASTSource = (
+      gl_runtime.GluonASTSource
+      if isinstance(fn, gl_runtime.GluonJITFunction)
+      else tc.ASTSource
     )
+    module = real_ASTSource(
+      fn, constexprs=constants, signature=signature, attrs=attrs
+    ).make_ir(gpu_target, options, codegen_fns, backend.get_module_map(), context)
+
     ttir = str(module)
 
     compilation_result = compile_ttir_inplace(
@@ -517,7 +528,7 @@ def get_or_create_triton_kernel(
 
 
 def triton_kernel_call_lowering(
-    backend_init_func,
+    make_gpu_target_func,
     ctx,
     *array_args,
     fn,
@@ -535,16 +546,30 @@ def triton_kernel_call_lowering(
     zeroed_outputs,
     debug,
     serialized_metadata,
-    **metaparams,
+    metaparams: tuple[tuple[str, Any], ...],
 ):
+  # we have to pass metaparams dictionary as a tuple to allow hashing necessary for
+  # lowering via xla_primitive_callable()
+  assert isinstance(metaparams, tuple), "metaparams must be tuple[tuple[str, Any], ...]"
+  metaparams = dict(metaparams)  # wil crash if tuple format is incompatible
+
   kernel_call_name = name
   args = list(ctx.avals_in)
   arg_dtypes = list(map(get_triton_type, ctx.avals_in))
   for idx, dtype, v in scalar_args:
     args.insert(idx, v)
     arg_dtypes.insert(idx, dtype)
-  args.extend(ctx.avals_out)
-  arg_dtypes.extend(map(get_triton_type, ctx.avals_out))
+  # extracting only avails_out not mentioned in input_output_aliases mapping
+  assert isinstance(input_output_aliases, tuple)
+  input_output_aliases = dict(input_output_aliases)
+  strictly_out_avals = [
+    aval
+    for i, aval in enumerate(ctx.avals_out)
+    if i not in input_output_aliases.values()
+  ]
+  args.extend(strictly_out_avals)
+  arg_dtypes.extend(map(get_triton_type, strictly_out_avals))
+
   named_args = dict(unsafe_zip(fn.arg_names, args))
 
   if isinstance(fn, autotuner.Autotuner):
@@ -601,10 +626,15 @@ def triton_kernel_call_lowering(
     configs = updated_configs
     fn = fn.fn
 
-  if not isinstance(fn, triton.JITFunction):
+  if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
     raise ValueError(
-        "`kernel` must be a Triton `JITFunction`, `Heuristics` or `Autotuner`."
+        "`kernel` must be a Triton `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner`."
     )
+
+  output2input = {v: k for k, v in input_output_aliases.items()}
+  assert len(output2input) == len(input_output_aliases), (
+    "input_output_aliases must be a bijection"
+  )
 
   outputs_offset = len(ctx.avals_in) + len(scalar_args)
   config_params = []
@@ -616,9 +646,13 @@ def triton_kernel_call_lowering(
     if callable(zeroed_outputs):
       config_zeroed_outputs = config_zeroed_outputs(config_metaparams)
 
+    # zeroed_params_with_sizes is a dict output_arg_idx -> aval_size_bytes
+    # config_zeroed_outputs is output ordinal numbers
     zeroed_params_with_sizes = {
-        i + outputs_offset: aval_size_bytes(ctx.avals_out[i])
-        for i in sorted(config_zeroed_outputs)
+      output2input[i] if i in output2input else i + outputs_offset: aval_size_bytes(
+        ctx.avals_out[i]
+      )
+      for i in sorted(config_zeroed_outputs)
     }
 
     config_params.append(
@@ -635,7 +669,7 @@ def triton_kernel_call_lowering(
   kernel_calls = []
   for params in config_params:
     kernel, specialization_attr = get_or_create_triton_kernel(
-        backend_init_func,
+        make_gpu_target_func,
         ctx.module_context.platforms[0],
         fn,
         arg_dtypes,
@@ -688,7 +722,7 @@ def triton_kernel_call_lowering(
     named_scalar_args = {fn.arg_names[i]: v for i, _, v in scalar_args}
     input_output_aliases_with_sizes = tuple(
         (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
-        for input_idx, output_idx in input_output_aliases
+        for input_idx, output_idx in input_output_aliases.items()
     )
     kernel_call = triton_kernel_call_lib.TritonAutotunedKernelCall(
         f"{kernel_call_name} ({fn.fn.__name__}) {named_scalar_args}",
@@ -703,20 +737,20 @@ def triton_kernel_call_lowering(
       custom_call_target_name,
       api_version=2,
       backend_config=zlib.compress(call_proto),
-      operand_output_aliases=dict(input_output_aliases),
+      operand_output_aliases=input_output_aliases,
   )
   return rule(ctx, *array_args)
 
 
 mlir.register_lowering(
     triton_kernel_call_p,
-    functools.partial(triton_kernel_call_lowering, get_cuda_backend),
+    functools.partial(triton_kernel_call_lowering, make_gpu_target_cuda),
     platform="cuda",
 )
 
 mlir.register_lowering(
     triton_kernel_call_p,
-    functools.partial(triton_kernel_call_lowering, get_hip_backend),
+    functools.partial(triton_kernel_call_lowering, make_gpu_target_hip),
     platform="rocm",
 )
 
@@ -762,6 +796,7 @@ def triton_call(
     *args: jax.Array | bool | int | float | np.float32,
     kernel: (
         triton.JITFunction
+        | gl_runtime.GluonJITFunction
         | triton.runtime.Heuristics
         | triton.runtime.Autotuner
     ),
@@ -780,7 +815,10 @@ def triton_call(
     ) = (),
     debug: bool = False,
     serialized_metadata: bytes = b"",
-    **metaparams: Any,
+    # two mutually exclusive ways to pass metaparams to let convenient use and allow
+    # passing params that clash with other parameters of this and related methods.
+    metaparams:dict | None = None,
+    **metaparams_dict: Any,
 ) -> Any:
   """Calls a Triton kernel with `jax.Array` arguments.
 
@@ -836,7 +874,8 @@ def triton_call(
   Args:
     *args: Inputs for the Triton kernel.
     kernel: A Triton kernel (e.g. a function decorated with `triton.jit`). All
-      static values should be annotated with `triton.language.constexpr`.
+      static values should be annotated with `triton.language.constexpr` or
+      `triton.experimental.gluon.language.constexpr`.
     out_shape: A `jax.ShapeDtypeStruct` (or something that has `.shape` and
       `.dtype` attributes) or a sequence thereof that specify the output(s) of
       the kernel. Pointers for each of the `jax.ShapeDtypeStruct`s in
@@ -858,8 +897,14 @@ def triton_call(
     debug: Prints out intermediate IRs if True for debugging purposes.
     serialized_metadata: Arbitrary metadata that will be added into the
       serialized kernel call.
-    **metaparams: Additional keyword arguments that will be provided to a `grid`
-      (if it is a function) and to the Triton kernel as `constexpr` arguments.
+    metaparams: A dictionary of arguments that will be provided to a `grid`
+      (if it is a function) and to the Triton kernel as `constexpr` arguments. Use it
+      instead of **metaparams_dict when keys might conflict with regular triton_call()
+      arguments. Note, either metaparams or metaparams_dict should be used, not both.
+    **metaparams_dict: Additional keyword arguments that will be provided to a `grid`
+      (if it is a function) and to the Triton kernel as `constexpr` arguments. Use it
+      instead of `metaparams` when keys won't conflict with regular triton_call()
+      arguments. Note, either metaparams or metaparams_dict should be used, not both.
 
   Returns:
     Outputs from the Triton kernel.
@@ -868,6 +913,17 @@ def triton_call(
     raise ValueError(
         "`triton_call` is only available when `triton` is installed."
     )
+
+  assert not metaparams or not metaparams_dict, (
+    "Either metaparams or metaparams_dict should be used, not both."
+  )
+  if not metaparams:
+    metaparams = metaparams_dict
+  if metaparams is None:
+    metaparams = {}
+  else:
+    assert isinstance(metaparams, dict), "metaparams must be a dictionary"
+
   out_shape = tree_util.tree_map(
       lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
@@ -905,6 +961,6 @@ def triton_call(
       zeroed_outputs=zeroed_outputs,
       debug=debug,
       serialized_metadata=serialized_metadata,
-      **metaparams,
+      metaparams=tuple(metaparams.items()),
   )
   return tree_util.tree_unflatten(out_tree, out_flat)

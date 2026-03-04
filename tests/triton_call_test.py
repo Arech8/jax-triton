@@ -49,9 +49,28 @@ def add_kernel(x_ptr, y_ptr, n_elements, output_ptr, BLOCK_SIZE: tl.constexpr):
   tl.store(output_ptr + offsets, output, mask=mask)
 
 
+@triton.jit
+def add_inplace_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr, INPLACE_Y: tl.constexpr):
+  pid = tl.program_id(axis=0)
+  block_start = pid * BLOCK_SIZE
+  offsets = block_start + tl.arange(0, BLOCK_SIZE)
+  mask = offsets < n_elements
+  x = tl.load(x_ptr + offsets, mask=mask)
+  y = tl.load(y_ptr + offsets, mask=mask)
+  output = x + y
+  if INPLACE_Y:
+    tl.store(y_ptr + offsets, output, mask=mask)
+  else:
+    tl.store(x_ptr + offsets, output, mask=mask)
+
+
 def add(x, y, *, kernel=add_kernel, **kwargs):
-  if kernel is add_kernel:
+  if kernel is add_kernel or kernel is add_inplace_kernel:
     kwargs.setdefault("BLOCK_SIZE", 8)
+  if kernel is add_inplace_kernel or (  # handling autotuner & possibly other wrappers
+    hasattr(kernel, "fn") and kernel.fn is add_inplace_kernel
+  ):
+    kwargs.setdefault("INPLACE_Y", False)
 
   default_grid = lambda meta: triton.cdiv(x.size, meta["BLOCK_SIZE"])
   return jt.triton_call(
@@ -63,6 +82,17 @@ def add(x, y, *, kernel=add_kernel, **kwargs):
       grid=kwargs.pop("grid", default_grid),
       **kwargs,
   )
+
+
+@triton.jit
+def inc_inplace_kernel(x_in_out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+  pid = tl.program_id(axis=0)
+  block_start = pid * BLOCK_SIZE
+  offsets = block_start + tl.arange(0, BLOCK_SIZE)
+  mask = offsets < n_elements
+  x = tl.load(x_in_out_ptr + offsets, mask=mask)
+  output = x + 1
+  tl.store(x_in_out_ptr + offsets, output, mask=mask)
 
 
 @triton.jit
@@ -283,28 +313,41 @@ class TritonKernelCallTest(parameterized.TestCase):
     np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
 
   def test_input_output_aliasing(self):
-    @triton.jit
-    def add_inplace_kernel(_, n_elements, output_ptr, BLOCK_SIZE: tl.constexpr):
-      pid = tl.program_id(axis=0)
-      block_start = pid * BLOCK_SIZE
-      offsets = block_start + tl.arange(0, BLOCK_SIZE)
-      mask = offsets < n_elements
-      x = tl.load(output_ptr + offsets, mask=mask)
-      output = x + 1
-      tl.store(output_ptr + offsets, output, mask=mask)
-
     size = 8
     x = random.normal(random.PRNGKey(0), [size])
     expected = x + 1
     out = jt.triton_call(
         x,
         size,
-        kernel=add_inplace_kernel,
+        kernel=inc_inplace_kernel,
         out_shape=x,
         grid=(8,),
         BLOCK_SIZE=1,
         input_output_aliases={0: 0},
     )
+    np.testing.assert_allclose(out, expected)
+
+  def test_input_output_aliasing_donate(self):
+    size = 8
+    x = random.normal(random.PRNGKey(0), [size])
+    expected = x + 1
+
+    x_ptr = x.unsafe_buffer_pointer()
+    out = jax.jit(
+      lambda x: jt.triton_call(
+        x,
+        size,
+        kernel=inc_inplace_kernel,
+        out_shape=x,
+        grid=(8,),
+        BLOCK_SIZE=1,
+        input_output_aliases={0: 0},
+      ),
+      donate_argnums=(0,),
+    )(x)
+
+    np.testing.assert_(x.is_deleted())
+    np.testing.assert_equal(x_ptr, out.unsafe_buffer_pointer())
     np.testing.assert_allclose(out, expected)
 
   @parameterized.parameters(False, True)
@@ -316,6 +359,8 @@ class TritonKernelCallTest(parameterized.TestCase):
         x,
         y,
         input_output_aliases={1: 0},
+        kernel=add_inplace_kernel,
+        INPLACE_Y=True,
         zeroed_outputs=(lambda _: (0,)) if use_function else (0,),
     )
     np.testing.assert_allclose(out, x)
@@ -523,7 +568,7 @@ class TritonKernelCallTest(parameterized.TestCase):
         triton.Config({"BLOCK_SIZE": 32}, num_warps=1),
         triton.Config({"BLOCK_SIZE": 64}, num_warps=1),
     ]
-    kernel = triton.autotune(autotune_configs, key=("n_elements",))(add_kernel)
+    kernel = triton.autotune(autotune_configs, key=("n_elements",))(add_inplace_kernel)
 
     x, y = create_random_inputs([1024])
     expected = x + y
