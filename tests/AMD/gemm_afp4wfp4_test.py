@@ -1,7 +1,5 @@
 import sys
 
-# from absl.testing import absltest
-# from absl.testing import parameterized
 import pytest
 
 import jax.numpy as jnp
@@ -265,4 +263,4 @@ def test_gemm_afp4_wfp4(
 
 
 if __name__ == "__main__":
-  sys.exit(pytest.main(sys.argv[1:]))
+  sys.exit(pytest.main(sys.argv))

@@ -10,10 +10,8 @@ from benchstats.common import LoggingConsole
 from benchstats.render import makeReadable
 import jax
 import jax.numpy as jnp
-import jax.random as random
 import jax_triton as jt
 import numpy as np
-from rich.progress import Progress
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -344,6 +342,8 @@ def run_benchmarks(
       "More than 1 device is visible. For potentially better results consistency, restrict the number of devices using ROCR_VISIBLE_DEVICES or similar environment variable."
     )
 
+  # we're interested in a wall-clock time of invoking kernels, including all python
+  # related overhead, so time.perf_counter_ns() used there is appropriate
   _, results = qb.benchmark(
     bms.values(),
     iters=iters,
@@ -353,7 +353,7 @@ def run_benchmarks(
     batch_functions=batch_functions,
     wait_complete=jax.block_until_ready,
     clear_cache=clear_l2,
-    show_progress_each=5,
+    show_progress_each=1 if batch_functions else 10,
     bm_names=bm_names,
     alt_delimiter="|",
     metrics={"mean": np.mean, "median": np.median, "min": np.min},
