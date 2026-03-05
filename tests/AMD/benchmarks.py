@@ -113,19 +113,6 @@ def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
 ######################################################################  startup
 
 
-@triton.jit
-def copy_scalar_triton(in_ptr, out_ptr):
-  value = tl.load(in_ptr)
-  tl.store(out_ptr, value)
-
-
-@gluon.jit
-def copy_scalar_gluon(in_ptr, out_ptr):
-  value = gl.load(in_ptr)
-  gl.store(out_ptr, value)
-
-
-# @register_benchmark_set
 @qb.registerBenchmark
 def make_startup_benchmark() -> dict[str, tuple[Callable, Callable]]:
   """
@@ -164,6 +151,16 @@ def make_startup_benchmark() -> dict[str, tuple[Callable, Callable]]:
       kernel.
   """
   NGigs = 4
+
+  @triton.jit
+  def copy_scalar_triton(in_ptr, out_ptr):
+    value = tl.load(in_ptr)
+    tl.store(out_ptr, value)
+
+  @gluon.jit
+  def copy_scalar_gluon(in_ptr, out_ptr):
+    value = gl.load(in_ptr)
+    gl.store(out_ptr, value)
 
   def startup(input: jnp.ndarray, kernel) -> jnp.ndarray:
     return jt.triton_call(
