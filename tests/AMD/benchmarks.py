@@ -33,7 +33,7 @@ def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
       mask = offsets < n_elements
       values = gl.load(values_ptr + offsets, mask=mask)
       counter_ptrs = counter_ptr + gl.zeros([BLOCK_SIZE], dtype=gl.int32, layout=layout)
-      gl.atomic_add(counter_ptrs, values, mask=mask)
+      gl.atomic_add(counter_ptrs, values, mask=mask, sem="relaxed")
 
   @triton.jit
   def atomic_add_triton(counter_ptr, values_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
@@ -44,7 +44,7 @@ def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
       values = tl.load(values_ptr + offsets, mask=mask)
       # Splat counter_ptr into a tensor of identical pointers
       counter_ptrs = counter_ptr + tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-      tl.atomic_add(counter_ptrs, values, mask=mask)
+      tl.atomic_add(counter_ptrs, values, mask=mask, sem="relaxed")
 
   @partial(jax.jit, donate_argnames="counter", static_argnums=(2,))
   def run_gluon(counter, values, num_warps: int = 16):
