@@ -22,22 +22,33 @@ import arch_info
 
 @qb.registerBenchmark
 def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
+  repeats = 1000
+  threads_per_block = 256
+  blocks = 1024
+  data_size = threads_per_block * blocks
 
   @gluon.jit
   def atomic_add_gluon(
-    counter_ptr, values_ptr, n_elements, BLOCK_SIZE: gl.constexpr, layout: gl.constexpr
+    counter_ptr,
+    values_ptr,
+    n_elements,
+    BLOCK_SIZE: gl.constexpr,
+    LAYOUT: gl.constexpr,
+    REPEATS: gl.constexpr,
   ):
-    for i in range(1000):
+    for i in range(REPEATS):
       pid = gl.program_id(0)
-      offsets = pid * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=layout)
+      offsets = pid * BLOCK_SIZE + gl.arange(0, BLOCK_SIZE, layout=LAYOUT)
       mask = offsets < n_elements
       values = gl.load(values_ptr + offsets, mask=mask)
-      counter_ptrs = counter_ptr + gl.zeros([BLOCK_SIZE], dtype=gl.int32, layout=layout)
+      counter_ptrs = counter_ptr + gl.zeros([BLOCK_SIZE], dtype=gl.int32, layout=LAYOUT)
       gl.atomic_add(counter_ptrs, values, mask=mask, sem="relaxed")
 
   @triton.jit
-  def atomic_add_triton(counter_ptr, values_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
-    for i in range(1000):
+  def atomic_add_triton(
+    counter_ptr, values_ptr, n_elements, BLOCK_SIZE: tl.constexpr, REPEATS: gl.constexpr
+  ):
+    for i in range(REPEATS):
       pid = tl.program_id(0)
       offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
       mask = offsets < n_elements
@@ -46,9 +57,9 @@ def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
       counter_ptrs = counter_ptr + tl.zeros([BLOCK_SIZE], dtype=tl.int32)
       tl.atomic_add(counter_ptrs, values, mask=mask, sem="relaxed")
 
-  @partial(jax.jit, donate_argnames="counter", static_argnums=(2,))
-  def run_gluon(counter, values, num_warps: int = 16):
-    assert values.size == 256 * 1024
+  @partial(jax.jit, donate_argnames="counter", static_argnums=(2, 3))
+  def run_gluon(counter, values, num_warps: int = 16, repeats: int = 1000):
+    assert values.size == data_size
     assert counter.size == 1 and counter.ndim == 1
     layout = gl.BlockedLayout(
       size_per_thread=[1],
@@ -67,12 +78,13 @@ def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
       num_warps=num_warps,
       input_output_aliases={0: 0},
       BLOCK_SIZE=BLOCK_SIZE,
-      layout=layout,
+      LAYOUT=layout,
+      REPEATS=repeats,
     )
 
-  @partial(jax.jit, donate_argnames="counter", static_argnums=(2,))
-  def run_triton(counter, values, num_warps: int = 16):
-    assert values.size == 256 * 1024
+  @partial(jax.jit, donate_argnames="counter", static_argnums=(2, 3))
+  def run_triton(counter, values, num_warps: int = 16, repeats: int = 1000):
+    assert values.size == data_size
     assert counter.size == 1 and counter.ndim == 1
     BLOCK_SIZE = num_warps * 64
     return jt.triton_call(
@@ -85,6 +97,7 @@ def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
       num_warps=num_warps,
       input_output_aliases={0: 0},
       BLOCK_SIZE=BLOCK_SIZE,
+      REPEATS=repeats,
     )
 
   # test (remove for range before enabling)
@@ -98,16 +111,29 @@ def make_atomic_add_benchmark() -> dict[str, tuple[Callable, Callable]]:
     assert c_g == c_t and c_g == values.sum()
 
   def init(n: int, dtype):
-    return [jnp.zeros((1,), dtype=dtype), jnp.ones(n, dtype=dtype)]
+    return [
+      jnp.zeros((1,), dtype=dtype),
+      jnp.ones(n, dtype=dtype),
+      blocks // 64,
+      repeats,
+    ]
 
-  return {
+  """return {
     f"atomic_add(262144 uint32)|gluon": (run_gluon, partial(init, 262144, jnp.uint32)),
     f"atomic_add(262144 uint32)|triton": (run_triton, partial(init, 262144, jnp.uint32)),
     f"atomic_add(262144 int32)|gluon": (run_gluon, partial(init, 262144, jnp.int32)),
     f"atomic_add(262144 int32)|triton": (run_triton, partial(init, 262144, jnp.int32)),
     f"atomic_add(262144 float32)|gluon": (run_gluon, partial(init, 262144, jnp.float32)),
     f"atomic_add(262144 float32)|triton": (run_triton, partial(init, 262144, jnp.float32)),
+  }"""
+
+  # fmt:off
+  return {
+    f"atomic_add({data_size}x{repeats})|uint32": (run_gluon, partial(init, data_size, jnp.uint32)),
+    f"atomic_add({data_size}x{repeats})|int32": (run_gluon,partial(init, data_size, jnp.int32)),
+    f"atomic_add({data_size}x{repeats})|float32": (run_gluon,partial(init, data_size, jnp.float32)),
   }
+  # fmt:on
 
 
 ######################################################################  gemm_afp4wfp4
