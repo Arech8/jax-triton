@@ -10,8 +10,8 @@ function setup_benchmarking() {
     # desirable. However, it's still better than nothing
 
     # rocm-smi --setfan 100% # fan control isn't supported on gfx950
-    rocm-smi --setperfdeterminism 1000
-    rocm-smi --setpoweroverdrive 900  # 1400W is gfx950 TDP. Note, setting too low would slowdown gluon!
+    rocm-smi --setperfdeterminism 1600
+    #rocm-smi --setpoweroverdrive 900  # 1400W is gfx950 TDP. Note, setting too low would slowdown gluon!
 
     #cpupower frequency-set -g performance
     #sysctl kernel.numa_balancing=0

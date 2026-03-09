@@ -310,6 +310,7 @@ def run_benchmarks(
       + ("" if random_inputs else "_NrI")
       + ("" if randomize_iterations else "_NrIT")
       + ("" if clear_cache else "_NCC")
+      + ("_BF" if batch_functions else "")
       + "_"
     )
     c = 0
