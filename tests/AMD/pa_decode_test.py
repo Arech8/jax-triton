@@ -6,9 +6,11 @@ import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
+import triton
 
 import _aiter
 import arch_info
+from pa_decode_gluon_kernel import get_recommended_splits, pa_decode_gluon
 
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/op_tests/triton_tests/test_pa_decode_gluon.py
 
@@ -68,6 +70,111 @@ def jax_uniform(key, shape, uni_range, dtype):
     minval=uni_range[0],
     maxval=uni_range[1],
   )
+
+
+def compare_arrays(
+  arr1: np.ndarray,
+  arr2: np.ndarray,
+  k: int = 5,
+  thresholds: List[float] = [0, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1],
+) -> Dict:
+  """
+  Compare two numpy arrays and compute various difference metrics.
+
+  Args:
+      arr1: First input array (float32)
+      arr2: Second input array (float32)
+      k: Number of top differences to return
+      thresholds: List of thresholds for difference magnitude analysis
+
+  Returns:
+      Dictionary containing:
+      - top_k_diff: Top k absolute differences with their positions
+      - threshold_stats: Count and percentage of differences above each threshold
+      - nan_info: Information about NaN values in input arrays
+  """
+  # Check input shapes
+  if arr1.shape != arr2.shape:
+    raise ValueError("Input arrays must have the same shape")
+  arr1 = arr1.astype(np.float32)
+  arr2 = arr2.astype(np.float32)
+
+  result = {"top_k_diff": [], "threshold_stats": [], "nan_info": {}}
+
+  # Check for NaN values
+  nan_mask1 = np.isnan(arr1)
+  nan_mask2 = np.isnan(arr2)
+
+  if np.any(nan_mask1):
+    result["nan_info"]["arr1_nan_count"] = np.sum(nan_mask1)
+    result["nan_info"]["arr1_nan_positions"] = np.argwhere(nan_mask1)
+    print(f"Warning: arr1 contains {result['nan_info']['arr1_nan_count']} NaN values")
+
+  if np.any(nan_mask2):
+    result["nan_info"]["arr2_nan_count"] = np.sum(nan_mask2)
+    result["nan_info"]["arr2_nan_positions"] = np.argwhere(nan_mask2)
+    print(f"Warning: arr2 contains {result['nan_info']['arr2_nan_count']} NaN values")
+
+  # Compute absolute differences
+  diff = np.abs(arr1 - arr2)
+  total_elements = arr1.size
+
+  max_diff_thr = diff / (1.0 + np.abs(arr2))
+  max_diff_thr = max_diff_thr.max()
+  # print(f"diff.abs.max={diff.max()}")
+  # print(f"max_diff_thr={max_diff_thr}")
+  result["max_diff"] = diff.max()
+  result["max_diff_thr"] = max_diff_thr
+
+  # Find top k differences
+  flat_diff = diff.flatten()
+  top_k_indices = np.argpartition(flat_diff, -k)[-k:]
+  top_k_indices = top_k_indices[np.argsort(-flat_diff[top_k_indices])]
+
+  # Convert flat indices to multi-dimensional indices
+  orig_indices = np.unravel_index(top_k_indices, diff.shape)
+  for i in range(k):
+    idx = tuple(dim[i] for dim in orig_indices)
+    result["top_k_diff"].append({
+      "value": diff[idx],
+      "position": idx,
+      "arr1_value": arr1[idx],
+      "arr2_value": arr2[idx],
+    })
+
+  # Compute threshold statistics
+  for i in range(len(thresholds) - 1):
+    lower = thresholds[i]
+    upper = thresholds[i + 1]
+    mask = (diff >= lower) & (diff < upper)
+    count = np.sum(mask)
+    result["threshold_stats"].append({
+      "range": f"[{lower:.1e}, {upper:.1e})",
+      "count": count,
+      "percentage": 100 * count / total_elements,
+    })
+
+  # Handle values above the largest threshold
+  mask = diff >= thresholds[-1]
+  count = np.sum(mask)
+  result["threshold_stats"].append({
+    "range": f">={thresholds[-1]:.1e}",
+    "count": count,
+    "percentage": 100 * count / total_elements,
+  })
+
+  # print("\nTop differences:")
+  # for item in result['top_k_diff']:
+  #     print(f"Position {item['position']}: arr1 = {arr1[item['position']]:.6f}, arr2 = {arr2[item['position']]:.6f}, Diff = {item['value']:.6f}")
+
+  # print("\nThreshold statistics:")
+  # for stat in result['threshold_stats']:
+  #     print(f"{stat['range']}: {stat['count']} ({stat['percentage']:.2f}%)")
+
+  # print("\nNaN info:")
+  # print(result["nan_info"])
+
+  return result
 
 
 # former get_kv_cache_torch_dtype
@@ -569,7 +676,8 @@ def prepare_gluon_query_and_scale(
   return quantized_query_gluon, query_scale_gluon, output_gluon
 
 
-def torch_attention_compute(
+# former torch_attention_compute
+def jax_attention_compute(
   query: jax.ndarray,  # [num_seqs, num_q_heads, head_size] - FP8
   key_cache: jax.ndarray,  # [num_blocks, num_kv_heads, head_size//x, block_size, x] - FP8
   value_cache: jax.ndarray,  # [num_blocks, num_kv_heads, head_size, block_size] or transposed - FP8
@@ -628,71 +736,69 @@ def torch_attention_compute(
     max_context_partition_num,
     query_group_size,
   )
-  max_logits = torch.full(
-    intermediate_shape, -float("inf"), dtype=torch.float32, device=query.device
-  )
-  exp_sums = torch.zeros(intermediate_shape, dtype=torch.float32, device=query.device)
-  partial_output = torch.zeros(
-    (*intermediate_shape, head_size), dtype=output_dtype, device=query.device
-  )
+  max_logits = jnp.full(intermediate_shape, -float("inf"), dtype=jnp.float32)
+  exp_sums = jnp.zeros(intermediate_shape, dtype=jnp.float32)
+  partial_output = jnp.zeros((*intermediate_shape, head_size), dtype=output_dtype)
 
-  FP8_MAX = torch.finfo(aiter.dtypes.fp8).max
+  FP8_MAX = jnp.finfo(_aiter.fp8).max
 
   # Quant mode detection
   query_quant_mode = -1
   if query_scale is not None:
-    query_quant_mode = 0 if query_scale.numel() == 1 else 1
+    query_quant_mode = 0 if query_scale.size == 1 else 1
 
   kv_quant_mode = -1
   if key_scale is not None and value_scale is not None:
-    kv_quant_mode = 0 if key_scale.numel() == 1 else 1
+    kv_quant_mode = 0 if key_scale.size == 1 else 1
 
   # Flatten caches for easy indexing
   # key_cache: [num_blocks, num_kv_heads, head_size//x, block_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
-  key_cache_flat = (
-    key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_kv_heads, head_size)
+  # key_cache_flat = (key_cache.permute(0, 3, 1, 2, 4).contiguous().view(-1, num_kv_heads, head_size))
+  key_cache_flat = jnp.reshape(
+    jnp.permute_dims(key_cache, (0, 3, 1, 2, 4)), (-1, num_kv_heads, head_size)
   )
+
   if value_transposed:
     # [num_blocks, num_kv_heads, block_size//x, head_size, x] -> [num_blocks * block_size, num_kv_heads, head_size]
-    value_cache_flat = (
-      value_cache.permute(0, 2, 4, 1, 3).contiguous().view(-1, num_kv_heads, head_size)
+    # value_cache_flat = (value_cache.permute(0, 2, 4, 1, 3).contiguous().view(-1, num_kv_heads, head_size))
+    value_cache_flat = jnp.reshape(
+      jnp.permute_dims(value_cache, (0, 2, 4, 1, 3)), (-1, num_kv_heads, head_size)
     )
   else:
     # [num_blocks, num_kv_heads, head_size, block_size] -> [num_blocks * block_size, num_kv_heads, head_size]
-    value_cache_flat = (
-      value_cache.permute(0, 3, 1, 2).contiguous().view(-1, num_kv_heads, head_size)
+    # value_cache_flat = (value_cache.permute(0, 3, 1, 2).contiguous().view(-1, num_kv_heads, head_size))
+    value_cache_flat = jnp.reshape(
+      jnp.permute_dims(value_cache, (0, 3, 1, 2)), (-1, num_kv_heads, head_size)
     )
 
   # Precompute block -> token mapping
   for seq_idx in range(num_seqs):
-    seq_len = context_lengths[seq_idx].item()
+    seq_len = context_lengths[seq_idx]
     block_table = block_tables[seq_idx]  # [max_blocks]
 
     # Build token -> physical index mapping
     num_tokens = seq_len
-    block_indices = torch.arange(num_tokens, device=query.device) // kv_block_size
-    token_offsets = torch.arange(num_tokens, device=query.device) % kv_block_size
+    block_indices = jnp.arange(num_tokens) // kv_block_size
+    token_offsets = jnp.arange(num_tokens) % kv_block_size
     physical_block_ids = block_table[block_indices]  # [num_tokens]
     physical_token_indices = (
       physical_block_ids * kv_block_size + token_offsets
     )  # [num_tokens]
 
     # Extract per-seq query
-    q = query[seq_idx].view(
-      num_kv_heads, query_group_size, head_size
-    )  # [num_kv_heads, query_group_size, head_size]
+    # q = query[seq_idx].view(num_kv_heads, query_group_size, head_size)  # [num_kv_heads, query_group_size, head_size]
+    q = jnp.reshape(query[seq_idx], (num_kv_heads, query_group_size, head_size))
     q_scale = 0
     if query_quant_mode >= 0:
       if query_quant_mode == 0:
-        q_scale = query_scale.item()
+        q_scale = query_scale
       else:
-        q_scale = query_scale[seq_idx].view(
-          num_kv_heads, query_group_size, 1
-        )  # [num_kv_heads, query_group_size, 1]
+        # q_scale = query_scale[seq_idx].view(num_kv_heads, query_group_size, 1)  # [num_kv_heads, query_group_size, 1]
+        q_scale = jnp.reshape(query_scale[seq_idx], (num_kv_heads, query_group_size, 1))
     if q.dtype != compute_type:
-      q_fp32 = q.to(compute_type).to(torch.float32)
+      q_fp32 = q.astype(compute_type).astype(jnp.float32)
     else:
-      q_fp32 = q.to(torch.float32)
+      q_fp32 = q.astype(jnp.float32)
     # q_fp32 = q.to(torch.float32)
 
     # Process each partition
@@ -707,18 +813,10 @@ def torch_attention_compute(
       ) // compute_block_size
 
       part_shape = (num_kv_heads, query_group_size)
-      max_logits_part = torch.full(
-        (*part_shape, 1),
-        -float("inf"),
-        dtype=torch.float32,
-        device=query.device,
-      )
-      exp_sums_part = torch.zeros(
-        *part_shape, 1, dtype=torch.float32, device=query.device
-      )
-      output_part = torch.zeros(
-        (*part_shape, head_size), dtype=torch.float32, device=query.device
-      )
+      max_logits_part = jnp.full((*part_shape, 1), -float("inf"), dtype=jnp.float32)
+      exp_sums_part = jnp.zeros((*part_shape, 1), dtype=jnp.float32)
+      output_part = jnp.zeros((*part_shape, head_size), dtype=jnp.float32)
+
       for cb in range(num_compute_blocks):
         cb_start = part_start + cb * compute_block_size
         cb_end = min(cb_start + compute_block_size, part_end)
@@ -726,14 +824,14 @@ def torch_attention_compute(
           break
         cb_len = cb_end - cb_start
 
-        token_range = torch.arange(cb_start, cb_end, device=query.device)
+        token_range = jnp.arange(cb_start, cb_end)
         indices = physical_token_indices[token_range]  # [cb_len]
 
         # Gather K/V
-        k = key_cache_flat.view(torch.int8)[indices].view(
+        k = key_cache_flat.astype(jnp.int8)[indices].astype(
           key_cache.dtype
         )  # [cb_len, num_kv_heads, head_size]
-        v = value_cache_flat.view(torch.int8)[indices].view(
+        v = value_cache_flat.astype(jnp.int8)[indices].astype(
           value_cache.dtype
         )  # [cb_len, num_kv_heads, head_size]
 
@@ -752,11 +850,14 @@ def torch_attention_compute(
             v_scale_vals = value_scale[
               block_ids, :, offsets, 0
             ]  # [cb_len, num_kv_heads]
-            k_scale_vals = k_scale_vals.reshape(cb_len, num_kv_heads, 1).permute(
-              1, 2, 0
+            # k_scale_vals = k_scale_vals.reshape(cb_len, num_kv_heads, 1).permute(1, 2, 0)  # [num_kv_heads, 1, cb_len]
+            k_scale_vals = jnp.permute_dims(
+              k_scale_vals.reshape(cb_len, num_kv_heads, 1), (1, 2, 0)
             )  # [num_kv_heads, 1, cb_len]
-            v_scale_vals = v_scale_vals.reshape(cb_len, num_kv_heads, 1).permute(
-              1, 2, 0
+
+            # v_scale_vals = v_scale_vals.reshape(cb_len, num_kv_heads, 1).permute(1, 2, 0)  # [num_kv_heads, 1, cb_len]
+            v_scale_vals = jnp.permute_dims(
+              v_scale_vals.reshape(cb_len, num_kv_heads, 1), (1, 2, 0)
             )  # [num_kv_heads, 1, cb_len]
 
         qk_scale = 0
@@ -773,19 +874,19 @@ def torch_attention_compute(
             qk_scale = softmax_scale
 
         if k.dtype != compute_type:
-          k_fp32 = k.to(compute_type).to(torch.float32)
+          k_fp32 = k.astype(compute_type).astype(jnp.float32)
         else:
-          k_fp32 = k.to(torch.float32)
+          k_fp32 = k.astype(jnp.float32)
         if v.dtype != compute_type:
-          v_fp32 = v.to(compute_type).to(torch.float32)
+          v_fp32 = v.astype(compute_type).astype(jnp.float32)
         else:
-          v_fp32 = v.to(torch.float32)
+          v_fp32 = v.astype(jnp.float32)
         # k_fp32 = k.to(torch.float32)
         # v_fp32 = v.to(torch.float32)
 
         # Compute QK = q @ k^T  --> [num_kv_heads, query_group_size, cb_len]
         # q_fp32: [num_kv_heads, query_group_size, head], k_fp32: [cb_len, num_kv_heads, head]
-        qk = torch.einsum(
+        qk = jnp.einsum(
           "hqd,khd->hqk", q_fp32, k_fp32
         )  # [num_kv_heads, query_group_size, cb_len]
 
@@ -797,18 +898,18 @@ def torch_attention_compute(
           slopes = alibi_slopes[
             :, :query_group_size
           ]  # [num_kv_heads, query_group_size]
-          positions = token_range.unsqueeze(0).unsqueeze(0)  # [1,1,cb_len]
+          positions = jnp.expand_dims(
+            jnp.expand_dims(token_range, axis=0), axis=0
+          )  # [1,1,cb_len]
           # In Triton: alibi_bias = slope * (col - kv_len + 1)
-          alibi_bias = slopes.unsqueeze(-1) * (
+          alibi_bias = jnp.expand_dims(slopes, axis=-1) * (
             positions - seq_len + 1
           )  # [num_kv_heads, query_group_size, cb_len]
           qk += alibi_bias
 
         # Causal mask
         if is_causal:
-          q_positions = torch.arange(
-            query_group_size, device=query.device
-          )  # [query_group_size]
+          q_positions = jnp.arange(query_group_size)  # [query_group_size]
           valid_mask = (
             q_seq_len
             - 1
@@ -818,28 +919,29 @@ def torch_attention_compute(
           )  # [query_group_size, cb_len]
           valid_mask = valid_mask[None, :, :]  # [1, query_group_size, cb_len]
           # valid_mask = token_range < seq_len  # [cb_len]
-          qk = qk.masked_fill(~valid_mask, -3.4e38)
+          # qk = qk.masked_fill(~valid_mask, -3.4e38)
+          qk = jnp.where(valid_mask, qk, -3.4e38)
 
         # Compute local max and exp
         current_max = qk.max(
-          dim=-1, keepdim=True
-        ).values  # [num_kv_heads, query_group_size, 1]
-        new_max = torch.maximum(
+          axis=-1, keepdims=True
+        )  # [num_kv_heads, query_group_size, 1]
+        new_max = jnp.maximum(
           max_logits_part, current_max
         )  # [num_kv_heads, query_group_size, 1]
-        acc_scale = torch.exp(max_logits_part - new_max)
+        acc_scale = jnp.exp(max_logits_part - new_max)
 
         # Compute attention probs
-        probs = torch.exp(qk - new_max)  # [num_kv_heads, query_group_size, cb_len]
+        probs = jnp.exp(qk - new_max)  # [num_kv_heads, query_group_size, cb_len]
         exp_sums_part = acc_scale * exp_sums_part + probs.sum(
-          dim=-1, keepdim=True
+          axis=-1, keepdims=True
         )  # [num_kv_heads, query_group_size, 1]
 
         # Handle value scaling for FP8 (Triton special logic)
         if kv_quant_mode == 1:
           valid_v_scale = v_scale_vals
           v_scale_max = valid_v_scale.max(
-            dim=-1, keepdim=True
+            axis=-1, keepdims=True
           ).values  # [num_kv_heads, 1, 1]
           # Avoid division by zero
           # v_scale_max = torch.clamp(v_scale_max, min=1e-12)
@@ -857,10 +959,10 @@ def torch_attention_compute(
           probs_scaled = probs
 
         # import pdb; pdb.set_trace()
-        probs_scaled = probs_scaled.to(compute_type).to(torch.float32)
+        probs_scaled = probs_scaled.astype(compute_type).astype(jnp.float32)
         # Compute PV = probs @ v
         # probs_scaled: [num_kv_heads, query_group_size, cb_len], v_fp32: [cb_len, num_kv_heads, head]
-        pv = torch.einsum(
+        pv = jnp.einsum(
           "hqk,khd->hqd", probs_scaled, v_fp32
         )  # [num_kv_heads, query_group_size, head]
 
@@ -876,14 +978,15 @@ def torch_attention_compute(
       exp_sums_part_reciprocal = 1.0 / exp_sums_part
       output_part = output_part * exp_sums_part_reciprocal
       # Store back
-      max_logits[seq_idx, :, part_idx, :] = max_logits_part.squeeze(-1)
-      exp_sums[seq_idx, :, part_idx, :] = exp_sums_part.squeeze(-1)
-      partial_output[seq_idx, :, part_idx, :, :] = output_part.to(output_dtype)
+      max_logits[seq_idx, :, part_idx, :] = jnp.squeeze(max_logits_part, axis=-1)
+      exp_sums[seq_idx, :, part_idx, :] = jnp.squeeze(exp_sums_part, axis=-1)
+      partial_output[seq_idx, :, part_idx, :, :] = output_part.astype(output_dtype)
 
   return exp_sums, max_logits, partial_output
 
 
-def torch_reduce_compute(
+# former torch_reduce_compute
+def jax_reduce_compute(
   output: jax.ndarray,  # [num_seqs, num_q_heads_total, head_size]
   exp_sums: jax.ndarray,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
   max_logits: jax.ndarray,  # [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
@@ -898,15 +1001,15 @@ def torch_reduce_compute(
   num_seqs = output.shape[0]
   num_q_heads_total = output.shape[1]
   head_size = output.shape[2]
-  final_output = torch.empty_like(output)
+  final_output = jnp.empty_like(output)
 
   for seq_idx in range(num_seqs):
-    seq_len = context_lengths[seq_idx].item()
+    seq_len = context_lengths[seq_idx]
     num_parts = (seq_len + context_partition_size - 1) // context_partition_size
 
     # Global max across partitions
-    global_max = (
-      max_logits[seq_idx, :, :num_parts, :].max(dim=1).values
+    global_max = max_logits[seq_idx, :, :num_parts, :].max(
+      axis=1
     )  # [num_kv_heads, query_group_size]
 
     # Rescale exp_sums
@@ -916,26 +1019,26 @@ def torch_reduce_compute(
     max_local = max_logits[
       seq_idx, :, :num_parts, :
     ]  # [num_kv_heads, num_parts, query_group_size]
-    exp_sums_rescaled = exp_sums_local * torch.exp(
-      max_local - global_max.unsqueeze(1)
+    exp_sums_rescaled = exp_sums_local * jnp.exp(
+      max_local - jnp.expand_dims(global_max, axis=1)
     )  # [num_kv_heads, num_parts, query_group_size]
-    global_exp_sum = exp_sums_rescaled.sum(dim=1)  # [num_kv_heads, query_group_size]
+    global_exp_sum = exp_sums_rescaled.sum(axis=1)  # [num_kv_heads, query_group_size]
 
     # Avoid division by zero
-    global_exp_sum = torch.clamp(global_exp_sum, min=1e-12)
+    global_exp_sum = jnp.clip(global_exp_sum, min=1e-12)
 
     # Weighted sum of partial outputs
-    weights = exp_sums_rescaled / global_exp_sum.unsqueeze(
-      1
+    weights = exp_sums_rescaled / jnp.expand_dims(
+      global_exp_sum, axis=1
     )  # [num_kv_heads, num_parts, query_group_size]
     partial_seq = temporary_output[
       seq_idx, :, :num_parts, :, :
     ]  # [num_kv_heads, num_parts, query_group_size, head]
-    weighted = (partial_seq * weights.unsqueeze(-1)).sum(
-      dim=1
+    weighted = (partial_seq * jnp.expand_dims(weights, axis=-1)).sum(
+      axis=1
     )  # [num_kv_heads, query_group_size, head]
 
-    final_output[seq_idx] = weighted.view(num_q_heads_total, head_size)
+    final_output[seq_idx] = jnp.reshape(weighted, (num_q_heads_total, head_size))
 
   return final_output
 
@@ -971,7 +1074,7 @@ def jax_mha_extend_flashattn_style(
   else:
     output_dtype = compute_type
   # Main attention computation stage
-  exp_sums, max_logits, partial_output = torch_attention_compute(
+  exp_sums, max_logits, partial_output = jax_attention_compute(
     query=query,
     key_cache=key_cache,
     value_cache=value_cache,
@@ -992,7 +1095,7 @@ def jax_mha_extend_flashattn_style(
 
   num_seqs, num_q_heads_total, head_size = query.shape
   # Reduce stage
-  final_output = torch_reduce_compute(
+  final_output = jax_reduce_compute(
     jnp.zeros((num_seqs, num_q_heads_total, head_size), dtype=output_dtype),
     exp_sums,
     max_logits,
@@ -1002,6 +1105,159 @@ def jax_mha_extend_flashattn_style(
   )
 
   return final_output
+
+
+def run_gluon_kernel(
+  output: jax.Array,
+  query: jax.Array,
+  key_cache: jax.Array,
+  value_cache: jax.Array,
+  context_lengths: jax.Array,
+  block_tables: jax.Array,
+  softmax_scale: float,
+  query_length: int,
+  max_context_partition_num: int,
+  context_partition_size: int,
+  compute_type,
+  query_scale: jax.Array,
+  key_scale: jax.Array,
+  value_scale: jax.Array,
+  exp_sums: jax.Array,
+  max_logits: jax.Array,
+  temporary_output: jax.Array,
+  alibi_slopes: Optional[jax.Array] = None,
+  use_aot_impl: bool = False,
+  sinks: Optional[jax.Array] = None,
+  sliding_window: int = 0,
+  ps=False,
+) -> None:
+  """Run Gluon FP8/BF16/FP16 kernel for paged attention.
+
+  Args:
+      output: Output tensor [num_seqs * query_length, num_query_heads, head_size]
+      query: Query tensor [num_seqs * query_length, num_query_heads, head_size]
+      key_cache: Key cache tensor [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
+      value_cache: Value cache tensor [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+      context_lengths: Current context lengths for each sequence [num_seqs]
+      block_tables: Mapping from sequences to physical cache blocks [num_seqs, max_num_blocks_per_seq]
+      softmax_scale: Softmax scale factor, typically 1/sqrt(head_size)
+      query_length: Query sequence length
+      max_context_length: Maximum sequence length supported
+      context_partition_size: Context partition size
+      compute_type: Compute data type (torch.dtype)
+      query_scale: Query scale tensor [num_seqs * query_length, num_query_heads, 1] or [1]
+      key_scale: Key scale tensor [num_blocks, num_kv_heads, kv_block_size, 1]
+      value_scale: Value scale tensor [num_blocks, num_kv_heads, kv_block_size, 1]
+      exp_sums: Exponential sums tensor [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+      max_logits: Max logits tensor [num_seqs, num_kv_heads, max_context_partition_num, query_group_size]
+      temporary_output: Temporary output tensor [num_seqs, num_kv_heads, max_context_partition_num, query_group_size, head_size]
+      alibi_slopes: Optional ALiBi slopes tensor
+      use_aot_impl: Whether to use AOT implementation (default: False)
+      sinks: Optional sinks tensor for attention sinks
+      sliding_window: Sliding window size (default: 0, disabled)
+
+  Returns:
+      None (modifies output in-place)
+      Note: The @perftest() decorator wraps this to return (None, avg_time)
+
+  This function can run in aot or jit mode based on use_aot_impl flag.
+  """
+  # Run kernel
+  if use_aot_impl and sliding_window == 0 and not ps:
+    assert False, "pa_decode_gluon_aot is not supported"
+    """pa_decode_gluon_aot(
+      output,
+      query,
+      key_cache,
+      value_cache,
+      context_lengths,
+      block_tables,
+      softmax_scale,
+      query_length,
+      max_context_partition_num,
+      context_partition_size,
+      compute_type,
+      query_scale,
+      key_scale,
+      value_scale,
+      exp_sums=exp_sums,
+      max_logits=max_logits,
+      temporary_output=temporary_output,
+      alibi_slopes=alibi_slopes,
+      sinks=sinks,
+    )"""
+  else:
+    pa_decode_gluon(
+      output,
+      query,
+      key_cache,
+      value_cache,
+      context_lengths,
+      block_tables,
+      softmax_scale,
+      query_length,
+      max_context_partition_num,
+      context_partition_size,
+      compute_type,
+      query_scale,
+      key_scale,
+      value_scale,
+      exp_sums=exp_sums,
+      max_logits=max_logits,
+      temporary_output=temporary_output,
+      alibi_slopes=alibi_slopes,
+      sinks=sinks,
+      sliding_window=sliding_window,
+      ps=ps,
+    )
+
+
+def checkAllclose(
+  a, b, rtol=1e-2, atol=1e-2, tol_err_ratio=0.05, msg="", printNum=8, printLog=True
+):
+  isClose = jnp.isclose(a, b, rtol=rtol, atol=atol)
+
+  if isClose.all():
+    if printLog:
+      print(f"{msg}[checkAllclose {atol=} {rtol=} \033[32mpassed~\033[0m]")
+    return 0
+  else:
+    try:
+      mask = ~isClose
+      num = mask.sum()
+      printNum = min(printNum, num)
+      percent = (num / a.numel()).item()
+      if not printLog:
+        return percent
+      a_msked = a[mask]
+      b_msked = b[mask]
+      delta = (a_msked - b_msked).abs()
+    except RuntimeError:
+      mask = ~isClose.to("cpu")
+      num = mask.sum()
+      printNum = min(printNum, num)
+      percent = (num / a.numel()).item()
+      if not printLog:
+        return percent
+      a_msked = a[mask]
+      b_msked = b[mask]
+      delta = (a_msked - b_msked).abs()
+    if percent > tol_err_ratio:
+      print(f"""{msg}[checkAllclose {atol=} {rtol=} \033[31mfailed!\033[0m]
+    a    : {a.shape}
+           {a_msked[:printNum]}
+    b    : {b.shape}
+           {b_msked[:printNum]}
+    delta:
+           {delta[:printNum]}""")
+    else:
+      print(
+        f"""{msg}[checkAllclose {atol=} {rtol=} \033[33mwarning!\033[0m] a and b results are not all close"""
+      )
+    print(
+      f"-->max abs delta:{delta.max()}, delta details: {percent:.1%} ({num} of {a.numel()}) elements"
+    )
+    return percent
 
 
 def run_pa_gluon_test(
@@ -1257,30 +1513,22 @@ def run_pa_gluon_test(
         batch_size * query_length, num_kv_heads * query_group_size, head_size
       )
     print("\n=== Comparing Two Reference Implementations ===")
-    ref_diff = (reference_output_quant - reference_output_flashattn).abs().max().item()
+    ref_diff = jnp.abs(reference_output_quant - reference_output_flashattn).max()
     print(f"FlashAttn-style Ref vs Original Ref: max diff = {ref_diff:.6e}")
     compare_arrays(
-      reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
-      reference_output_quant.to(torch.float32).detach().cpu().numpy(),
+      np.array(reference_output_flashattn.astype(jnp.float32)),
+      np.array(reference_output_quant.astype(jnp.float32)),
     )
-    out_flashattn_ref_md5 = hashlib.md5(
-      reference_output_flashattn
-      .contiguous()
-      .view(torch.uint8)
-      .detach()
-      .cpu()
-      .numpy()
-      .tobytes()
-    ).hexdigest()
-    print(f"out_flashattn_ref_md5={out_flashattn_ref_md5}")
+    # out_flashattn_ref_md5 = hashlib.md5(reference_output_flashattn.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+    # print(f"out_flashattn_ref_md5={out_flashattn_ref_md5}")
 
   # Create intermediate tensors for attention computation
   num_seqs = batch_size
   num_kv_heads_local = num_kv_heads  # Avoid shadowing
   max_context_length = (
-    min(context_lengths.max().item(), sliding_window)
+    min(context_lengths.max(), sliding_window)
     if sliding_window > 0
-    else context_lengths.max().item()
+    else context_lengths.max()
   )
   if sliding_window > 0:
     max_context_partition_num = 1
@@ -1297,20 +1545,13 @@ def run_pa_gluon_test(
     equivalent_query_group_size,
   )
 
-  exp_sums = torch.empty(
-    intermediate_shape, dtype=torch.float32, device=reference_output_quant.device
-  )
-  max_logits = torch.empty(
-    intermediate_shape, dtype=torch.float32, device=reference_output_quant.device
-  )
-  temporary_output = torch.empty(
-    *intermediate_shape,
-    head_size,
-    dtype=reference_output_quant.dtype,
-    device=reference_output_quant.device,
+  exp_sums = jnp.empty(intermediate_shape, dtype=jnp.float32)
+  max_logits = jnp.empty(intermediate_shape, dtype=jnp.float32)
+  temporary_output = jnp.empty(
+    (*intermediate_shape, head_size), dtype=reference_output_quant.dtype
   )
   # Create output tensor with the same shape as reference
-  final_output_gluon = torch.empty_like(reference_output_quant)
+  final_output_gluon = jnp.empty_like(reference_output_quant)
 
   _, gluon_time = run_gluon_kernel(
     final_output_gluon,
@@ -1351,8 +1592,8 @@ def run_pa_gluon_test(
   print("\n=== Detailed Error Analysis ===")
   print("Gluon vs Original Ref:")
   diff_result = compare_arrays(
-    final_output_gluon.to(torch.float32).detach().cpu().numpy(),
-    reference_output_quant.to(torch.float32).detach().cpu().numpy(),
+    np.array(final_output_gluon.astype(jnp.float32)),
+    np.array(reference_output_quant.astype(jnp.float32)),
   )
   if diff_result["max_diff_thr"] < diff_tolerance:
     print("gluon_vs_torch_ref PASSED")
@@ -1365,8 +1606,8 @@ def run_pa_gluon_test(
   if USE_TORCH_FLASH_REF:
     print("\nGluon vs FlashAttn-style Ref:")
     diff_result = compare_arrays(
-      final_output_gluon.to(torch.float32).detach().cpu().numpy(),
-      reference_output_flashattn.to(torch.float32).detach().cpu().numpy(),
+      np.array(final_output_gluon.astype(jnp.float32)),
+      np.array(reference_output_flashattn.astype(jnp.float32)),
     )
     if diff_result["max_diff_thr"] < flash_style_diff_tolerance:
       print("gluon_vs_torch_flash_ref PASSED")
@@ -1374,20 +1615,10 @@ def run_pa_gluon_test(
       print("gluon_vs_torch_flash_ref FAILED")
 
   # MD5 hash
-  out_ref_md5 = hashlib.md5(
-    reference_output_quant
-    .contiguous()
-    .view(torch.uint8)
-    .detach()
-    .cpu()
-    .numpy()
-    .tobytes()
-  ).hexdigest()
-  gluon_hash = hashlib.md5(
-    final_output_gluon.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()
-  ).hexdigest()
-  print(f"out_ref_md5={out_ref_md5}")
-  print(f"gluon_output_md5={gluon_hash}")
+  #out_ref_md5 = hashlib.md5(reference_output_quant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+  #gluon_hash = hashlib.md5(final_output_gluon.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+  #print(f"out_ref_md5={out_ref_md5}")
+  #print(f"gluon_output_md5={gluon_hash}")
 
   # Bandwidth
   kernel_time_us = gluon_time
@@ -1403,7 +1634,7 @@ def run_pa_gluon_test(
     or (query_group_size == 5 and query_length == 3)
     or (block_size == 64)
     or (not quant_kv)
-    or (compute_type == torch.float16 and (quant_q or quant_kv))
+    or (compute_type == jnp.float16 and (quant_q or quant_kv))
     or (head_size not in [128])
     or (sliding_window > 0)
     or True
@@ -1414,7 +1645,8 @@ def run_pa_gluon_test(
     key_scale_original = key_scale_factors_flat.contiguous()
     value_scale_original = value_scale_factors_flat.contiguous()
   if not skip_assembly:
-    assembly_output, assembly_time = run_aiter_assembly_kernel(
+    assert False, "run_aiter_assembly_kernel is not supported"
+    """assembly_output, assembly_time = run_aiter_assembly_kernel(
       query,
       quantized_keys,
       quantized_values,
@@ -1444,6 +1676,7 @@ def run_pa_gluon_test(
     results["perf_gluon_vs_asm"] = f"{results['us_asm'] / results['us_gluon']:.0%}"
   else:
     results["perf_gluon_vs_asm"] = "NaN"
+  """
 
   sys.stdout.flush()
 
