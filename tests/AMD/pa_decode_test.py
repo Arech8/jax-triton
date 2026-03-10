@@ -1615,10 +1615,10 @@ def run_pa_gluon_test(
       print("gluon_vs_torch_flash_ref FAILED")
 
   # MD5 hash
-  #out_ref_md5 = hashlib.md5(reference_output_quant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-  #gluon_hash = hashlib.md5(final_output_gluon.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
-  #print(f"out_ref_md5={out_ref_md5}")
-  #print(f"gluon_output_md5={gluon_hash}")
+  # out_ref_md5 = hashlib.md5(reference_output_quant.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+  # gluon_hash = hashlib.md5(final_output_gluon.contiguous().view(torch.uint8).detach().cpu().numpy().tobytes()).hexdigest()
+  # print(f"out_ref_md5={out_ref_md5}")
+  # print(f"gluon_output_md5={gluon_hash}")
 
   # Bandwidth
   kernel_time_us = gluon_time
