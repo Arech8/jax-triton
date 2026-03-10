@@ -1,26 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+# based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/gluon/pa_decode_gluon.py
+
 from functools import lru_cache
 # import torch
-import aiter
-import aiter.ops.triton.utils._triton.arch_info as arch_info
+import _aiter
+import arch_info
 
 import triton
 import triton.language as tl
 
-GLUON_JIT_KERNEL_ENABLED = True
-try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-except ImportError:
-    print(
-        "Warning: triton.experimental.gluon or triton.experimental.gluon.language not exists, gluon can only be used in triton AOT mode!"
-    )
-    gluon = triton
-    gl = tl
-    GLUON_JIT_KERNEL_ENABLED = False
-
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 @lru_cache(maxsize=1)
 def get_cdna_version():
