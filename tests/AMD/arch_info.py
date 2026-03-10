@@ -1,5 +1,7 @@
 import triton
 from functools import lru_cache
+import jax
+import ctypes
 
 
 # https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/utils/_triton/arch_info.py
