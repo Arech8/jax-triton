@@ -359,7 +359,10 @@ def make_backend(
 
   # TODO(sharadmv): handle multiple devices, right now we assume device 0
   # which is fine when we have multiple of the same GPU but this won't work in
-  # general.
+  # general. See also how Triton did this in JITFunction's
+  # `self.device_caches = defaultdict(self.create_binder)` -- it spawns a new set of
+  # precomputes for each new device with `x,y,z = self.device_caches[device]` using the
+  # create_binder() factory function.
   device = 0
   if compute_capability is None:
     compute_capability = triton_kernel_call_lib.get_compute_capability(device)
@@ -457,11 +460,21 @@ def get_or_create_triton_kernel(
       (i,): backend.parse_attr(attr)
       for i, (_, attr) in enumerate(specialization)
   }
-  constants = dict(metaparams)
-  constants.update({k: None for _, k, v in scalar_args if v is None})
-  constants.update({fn.arg_names[i]: 1 for i, _, v in scalar_args if v == 1})
+
+  # note that fn already have .constexprs, but it's a todo for removal
+  constexpr_names = (
+    fn.constexprs
+    if hasattr(fn, "constexprs")
+    else [p.name for p in fn.params if p.is_constexpr]
+  )
+
+  backend_fields = set(type(backend.parse_options({})).__dataclass_fields__.keys())
+
+  constexprs = dict(metaparams)
+  constexprs.update({k: None for _, k, v in scalar_args if v is None})
+  constexprs.update({fn.arg_names[i]: 1 for i, _, v in scalar_args if v == 1})
   # adding constexprs info to the signature
-  for constant in constants:
+  for constant in constexprs:
     signature[constant] = "constexpr"
 
   # Cache key should contain any parameter that can affect the compiler output.
@@ -469,7 +482,7 @@ def get_or_create_triton_kernel(
       fn,
       tuple(signature.items()),
       tuple(specialization),
-      tuple(constants.items()),
+      tuple(constexprs.items()),
       num_warps,
       num_stages,
       num_ctas,
@@ -520,7 +533,7 @@ def get_or_create_triton_kernel(
       else tc.ASTSource
     )
     module = real_ASTSource(
-      fn, constexprs=constants, signature=signature, attrs=attrs
+      fn, constexprs=constexprs, signature=signature, attrs=attrs
     ).make_ir(gpu_target, options, codegen_fns, backend.get_module_map(), context)
 
     ttir = str(module)
@@ -1063,7 +1076,7 @@ def triton_call(
       *array_args,
       fn=kernel,
       scalar_args=tuple(scalar_args),
-      name=name,
+      kernel_call_name=name,
       custom_call_target_name=custom_call_target_name,
       out_shapes=tuple(flat_out_shapes),
       grid=grid,
