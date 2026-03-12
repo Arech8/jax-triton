@@ -422,7 +422,9 @@ def get_or_create_triton_kernel(
   # Their implementation handle params better, but we likely can't use their code since
   # they supply an argument value to specialize_impl() directly, while we can't do it
   # due to how jit compilation with traced values work, which doesn't even have actual
-  # argument values, that's why the below code uses fake value of types.SimpleNamespace
+  # argument values, that's why the below code uses fake value of types.SimpleNamespace.
+  # Also we only specialize runtime arguments (not constexprs!), while their impl does
+  # it for everything.
 
   # problems with the below code:
   # 1. probably doesn't handle constexprs properly due to a wrong specialize_impl() call
