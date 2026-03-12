@@ -352,28 +352,11 @@ def compile_ttir_to_hsaco_inplace(
   )
 
 
-_COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
+def make_backend(
+  make_gpu_target_func, compute_capability: int | None, num_ctas: int
+) -> tuple[triton.compiler.BaseBackend, triton.compiler.GPUTarget, int]:
+  """Resolves compute_capability and spawns triton's Backend and GPUTarget objects"""
 
-
-def get_or_create_triton_kernel(
-    make_gpu_target_func,
-    platform,
-    fn,
-    arg_dtypes,
-    scalar_args,
-    *,
-    num_warps,
-    num_stages,
-    num_ctas,
-    compute_capability,
-    enable_fp_fusion,
-    metaparams,
-    dump: bool,
-) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:
-  if num_warps is None:
-    num_warps = 4
-  if num_stages is None:
-    num_stages = 3
   # TODO(sharadmv): handle multiple devices, right now we assume device 0
   # which is fine when we have multiple of the same GPU but this won't work in
   # general.
@@ -386,6 +369,65 @@ def get_or_create_triton_kernel(
   gpu_target = make_gpu_target_func(device, compute_capability)
   backend = triton.compiler.make_backend(gpu_target)
 
+  return backend, gpu_target, compute_capability
+
+
+_COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
+
+
+def get_or_create_triton_kernel(
+  make_gpu_target_func,
+  platform: str,
+  fn: triton.JITFunction | gl_runtime.GluonJITFunction,
+  arg_dtypes: list[str],
+  scalar_args: tuple[tuple[int, str, Any], ...],
+  *,
+  # num_warps,
+  # num_stages,
+  # num_ctas,
+  compute_capability: int | None,
+  # enable_fp_fusion,
+  metaparams: dict[str, Any],
+  # debug: bool,
+) -> tuple[triton_kernel_call_lib.TritonKernel, Any]:
+  # TODO: some vars below could be removed
+  num_warps = metaparams["num_warps"]
+  num_stages = metaparams["num_stages"]
+  num_ctas = metaparams["num_ctas"]
+  enable_fp_fusion = metaparams["enable_fp_fusion"]
+  assert all(isinstance(v, int) for v in (num_warps, num_stages, num_ctas))  # sanity
+
+  backend, gpu_target, compute_capability = make_backend(
+    make_gpu_target_func, compute_capability, num_ctas
+  )
+
+  # TODO(Arech): triton.runtime.jit.create_function_from_signature() is better here
+  # The binder it generates takes kernel positional argument values (from scalar_args)
+  # and all kwargs passed to the triton's launcher (as options, for us it's metaparams)
+  # and returns a tuple of 3: 1 is a dict kernel_param_name->value mapping each
+  # (positional and key-value) argument name to its value; 2 is a list of
+  # specializations; 3 seems to be just forwarding of the options/kwargs/metaparams back.
+  #
+  # Specialization is list[tuple[str, Any]], where first element of tuple is the arg type
+  # (or "constexpr" for constants), and the second parameter is the 'specialization'
+  # value which is an attribute designed to trigger a separately compiled kernel variant
+  # for that specific argument value (it let chose a specific compiled kernel that's
+  # best for argument value and its alignment; such as special cases for constexprs,
+  # ones, and values divisible by 16)
+  #
+  # Their implementation handle params better, but we likely can't use their code since
+  # they supply an argument value to specialize_impl() directly, while we can't do it
+  # due to how jit compilation with traced values work, which doesn't even have actual
+  # argument values, that's why the below code uses fake value of types.SimpleNamespace
+
+  # problems with the below code:
+  # 1. probably doesn't handle constexprs properly due to a wrong specialize_impl() call
+  # It uses types.SimpleNamespace() instead of actual constexpr argument, and the code
+  # https://github.com/triton-lang/triton/blob/release/3.6.x/python/src/specialize.cc#L491
+  # checks the constexrness by essentially `isinstance()`.
+
+  ##############################
+
   signature = {fn.arg_names[i]: v for i, v in enumerate(arg_dtypes)}
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
   # We assume that all arrays are aligned to 16 bytes, and Triton may use this
@@ -394,7 +436,7 @@ def get_or_create_triton_kernel(
   for i, _, _ in scalar_args:
     alignments[i] = 0
   specialize_impl = _triton.native_specialize_impl
-  is_const = False
+  is_const = False # BUG this is wrong! must depend on the param type!
   do_specialize = True
   specialization = [
       specialize_impl(
@@ -450,8 +492,7 @@ def get_or_create_triton_kernel(
         "num_warps": num_warps,
         "num_stages": num_stages,
         "num_ctas": num_ctas,
-        "optimize_epilogue": False,
-        "debug": dump,
+        "debug": metaparams["debug"],
         "enable_fp_fusion": enable_fp_fusion,
     }
 
@@ -526,41 +567,98 @@ def get_or_create_triton_kernel(
   return kernel, attrs
 
 
-def triton_kernel_call_lowering(
-    make_gpu_target_func,
-    ctx,
-    *array_args,
-    fn,
-    scalar_args,
-    name,
-    custom_call_target_name,
-    out_shapes,
-    grid,
-    num_warps,
-    num_stages,
-    num_ctas,
-    compute_capability,
-    enable_fp_fusion,
-    input_output_aliases,
-    zeroed_outputs,
-    debug,
-    serialized_metadata,
-    metaparams: tuple[tuple[str, Any], ...],
-):
-  # we have to pass metaparams dictionary as a tuple to allow hashing necessary for
-  # lowering via xla_primitive_callable()
-  assert isinstance(metaparams, tuple), "metaparams must be tuple[tuple[str, Any], ...]"
-  metaparams = dict(metaparams)  # wil crash if tuple format is incompatible
+def make_autotuner_configs(
+  fn: autotuner.Autotuner,
+  scalar_args: tuple[tuple[int, str, Any], ...],
+  metaparams: dict[str, Any],
+  named_args: dict[str, Any],
+) -> tuple[
+  list[triton.Config],
+  autotuner.Heuristics | triton.JITFunction | gl_runtime.GluonJITFunction,
+]:
+  """ Make and prune redundant autotuner configs based on user-provided metaparams.
 
-  kernel_call_name = name
+  If any metaparams have been specified explicitly, we prune any configs that conflict.
+  The pruning serves a specific need in jax-triton's architecture: unlike native Triton
+  where autotuning happens dynamically at kernel launch, jax-triton must decide at
+  lowering/tracing time which configs to compile. If the user has already fixed certain
+  metaparameters (e.g., num_warps=4, BLOCK_SIZE=128), there's no point compiling or
+  benchmarking autotuner configs that specify different values for those same
+  parameters. The pruning eliminates those contradictory configs, reducing compilation
+  and benchmarking work.
+
+  Note that our implementation is more permissive than Triton's autotuner implementation, which will
+  throw an error if any keys match.
+  """
+  assert isinstance(fn, autotuner.Autotuner)
+
+  key_idxs = [fn.arg_names.index(k) for k in fn.keys]
+  if any(idx not in key_idxs for idx, _, _ in scalar_args):
+    logging.warning(
+        "Auto-tuning key does not include all scalar arguments. "
+        "We may perform redundant auto-tuning."
+    )
+
+  prev_early_config_prune_fn = fn.early_config_prune
+
+  def prune_configs(configs, named_args, **kwargs):
+    pruned_configs = []
+    for config in configs:
+      if config.pre_hook is not None:
+        raise NotImplementedError("`pre_hook` is not supported")
+
+      # Keep the config IIF for every user-provided metaparam (k, v), the config
+      # either doesn't specify k at all, or specifies the same value v. This ensures
+      # the config is coherent with explicit user choices
+      if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
+        pruned_configs.append(config)
+    if prev_early_config_prune_fn is not None:
+      pruned_configs = prev_early_config_prune_fn(pruned_configs, named_args)
+    return pruned_configs
+
+  fn.early_config_prune = prune_configs
+  fn.nargs = named_args
+  configs = fn.prune_configs(metaparams)
+  return configs, fn.fn
+
+
+def make_configs_from_heuristics(
+  fn: autotuner.Heuristics,
+  configs: list[triton.Config],
+  metaparams: dict[str, Any],
+  named_args: dict[str, Any],
+) -> tuple[
+  list[triton.Config],
+  triton.JITFunction | gl_runtime.GluonJITFunction,
+]:
+  """Applies heuristics to the configs and returns the updated configs and the function."""
+  assert isinstance(fn, autotuner.Heuristics)
+
+  updated_configs = []
+  for config in configs:
+    kwargs = config.kwargs.copy()
+    for name, heuristic in fn.values.items():
+      kwargs[name] = heuristic({**named_args, **metaparams, **kwargs})
+    updated_config = copy.copy(config)
+    updated_config.kwargs = kwargs
+    updated_configs.append(updated_config)
+  return updated_configs, fn.fn
+
+
+def extract_avals(
+  ctx,
+  scalar_args: tuple[tuple[int, str, Any], ...],
+  input_output_aliases: dict[int, int],
+) -> tuple[list[Any], list[str]]:
+  """ Extract abstract values and their dtypes from the context."""
+
   args = list(ctx.avals_in)
   arg_dtypes = list(map(get_triton_type, ctx.avals_in))
   for idx, dtype, v in scalar_args:
     args.insert(idx, v)
     arg_dtypes.insert(idx, dtype)
+
   # Extract only the output avals not referenced in the input_output_aliases mapping.
-  assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
-  input_output_aliases = dict(input_output_aliases)
   strictly_out_avals = [
     aval
     for i, aval in enumerate(ctx.avals_out)
@@ -569,80 +667,39 @@ def triton_kernel_call_lowering(
   args.extend(strictly_out_avals)
   arg_dtypes.extend(map(get_triton_type, strictly_out_avals))
 
-  named_args = dict(unsafe_zip(fn.arg_names, args))
+  return args, arg_dtypes
 
-  if isinstance(fn, autotuner.Autotuner):
-    if hasattr(fn, "key_idx"):
-      key_idxs = fn.key_idx  # Triton <=3.2
-    else:
-      key_idxs = [fn.arg_names.index(k) for k in fn.keys]
-    if any(idx not in key_idxs for idx, _, _ in scalar_args):
-      logging.warning(
-          "Auto-tuning key does not include all scalar arguments. "
-          "We may perform redundant auto-tuning."
-      )
 
-    # If any metaparams have been specified explicitly, we prune any configs
-    # that conflict. Note that this is more permissive than Triton's autotuner
-    # implementation, which will throw an error if any keys match.
-    # TODO(cjfj): Prune explicit `num_warps` / `num_stages`.
-    prev_early_config_prune_fn = fn.early_config_prune
-
-    def prune_configs(configs, named_args, **kwargs):
-      pruned_configs = []
-      for config in configs:
-        if config.pre_hook is not None:
-          raise NotImplementedError("`pre_hook` is not supported")
-
-        if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
-          pruned_configs.append(config)
-      if prev_early_config_prune_fn is not None:
-        pruned_configs = prev_early_config_prune_fn(pruned_configs, named_args)
-      return pruned_configs
-
-    fn.early_config_prune = prune_configs
-    fn.nargs = named_args
-    configs = fn.prune_configs(metaparams)
-    fn = fn.fn
-  else:
-    config = triton.Config(
-        {},
-        num_warps=num_warps,
-        num_stages=num_stages,
-        num_ctas=num_ctas,
-    )
-    configs = [config]
-
-  if isinstance(fn, autotuner.Heuristics):
-    updated_configs = []
-    for config in configs:
-      kwargs = config.kwargs.copy()
-      for name, heuristic in fn.values.items():
-        kwargs[name] = heuristic({**named_args, **metaparams, **kwargs})
-      updated_config = copy.copy(config)
-      updated_config.kwargs = kwargs
-      updated_configs.append(updated_config)
-    configs = updated_configs
-    fn = fn.fn
-
-  if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
-    raise ValueError(
-        "`kernel` must be a Triton `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner`."
-    )
-
+def make_kernel_params(
+  ctx,
+  num_scalar_args: int,
+  metaparams: dict[str, Any],
+  grid,
+  zeroed_outputs,
+  input_output_aliases: dict[int, int],
+  configs: list[triton.Config],
+) -> list[dict[str, Any]]:
+  """Make kernel call parameters for each config."""
   output2input = {v: k for k, v in input_output_aliases.items()}
   if len(output2input) != len(input_output_aliases):
     raise ValueError("input_output_aliases must be a bijection")
 
-  outputs_offset = len(ctx.avals_in) + len(scalar_args)
-  config_params = []
+  outputs_offset = len(ctx.avals_in) + num_scalar_args
+  zeroed_outputs_callable = callable(zeroed_outputs)
+
+  kernel_params = []
   for config in configs:
     config_metaparams = {**metaparams, **config.kwargs}
+    # sanity checks to ensure no divergence had happened
+    assert config_metaparams["num_warps"] == config.num_warps
+    assert config_metaparams["num_stages"] == config.num_stages
+    assert config_metaparams["num_ctas"] == config.num_ctas
+
     config_grid = normalize_grid(grid, config_metaparams)
 
-    config_zeroed_outputs = zeroed_outputs
-    if callable(zeroed_outputs):
-      config_zeroed_outputs = config_zeroed_outputs(config_metaparams)
+    config_zeroed_outputs = (
+      zeroed_outputs(config_metaparams) if zeroed_outputs_callable else zeroed_outputs
+    )
 
     # zeroed_params_with_sizes is a dict output_arg_idx -> aval_size_bytes
     # config_zeroed_outputs is output ordinal numbers
@@ -653,41 +710,105 @@ def triton_kernel_call_lowering(
       for i in sorted(config_zeroed_outputs)
     }
 
-    config_params.append(
-        dict(
-            metaparams=tuple(sorted(config_metaparams.items())),
-            num_warps=config.num_warps,
-            num_stages=config.num_stages,
-            num_ctas=config.num_ctas,
-            grid=config_grid,
-            zeroed_params_with_sizes=tuple(zeroed_params_with_sizes.items()),
-        )
+    kernel_params.append(
+      dict(
+        metaparams=tuple(sorted(config_metaparams.items())),
+        # num_warps=config.num_warps,
+        # num_stages=config.num_stages,
+        # num_ctas=config.num_ctas,
+        grid=config_grid,
+        zeroed_params_with_sizes=tuple(zeroed_params_with_sizes.items()),
+      )
     )
+  return kernel_params
+
+
+def triton_kernel_call_lowering(
+    make_gpu_target_func,
+    ctx,
+    *array_args,
+    fn,
+    scalar_args,
+    kernel_call_name,
+    custom_call_target_name,
+    out_shapes,
+    grid,
+    compute_capability,
+    input_output_aliases,
+    zeroed_outputs,
+    serialized_metadata,
+    metaparams: tuple[tuple[str, Any], ...],
+):
+  # we have to pass metaparams dictionary as a tuple to allow hashing necessary for
+  # lowering via xla_primitive_callable()
+  assert isinstance(metaparams, tuple), "metaparams must be tuple[tuple[str, Any], ...]"
+  metaparams = dict[str, Any](metaparams)
+  assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
+  input_output_aliases = dict[int,int](input_output_aliases)
+
+  # if it fires, it's a programmer's mistake and no exception handling could fix that
+  assert all(
+    isinstance(metaparams[k], int) for k in ("num_warps", "num_stages", "num_ctas")
+  ), "num_warps, num_stages, and num_ctas must be integers"
+
+  args, arg_dtypes = extract_avals(ctx, scalar_args, input_output_aliases)
+
+  named_args = dict(unsafe_zip(fn.arg_names, args))
+
+  if isinstance(fn, autotuner.Autotuner):
+    configs, fn = make_autotuner_configs(fn, scalar_args, metaparams, named_args)
+  else:
+    configs = [
+      triton.Config(
+        {},
+        num_warps=metaparams["num_warps"],
+        num_stages=metaparams["num_stages"],
+        num_ctas=metaparams["num_ctas"],
+      )
+    ]
+
+  if isinstance(fn, autotuner.Heuristics):
+    configs, fn = make_configs_from_heuristics(fn, configs, metaparams, named_args)
+
+  if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
+    raise ValueError(
+        "`kernel` must be a Triton `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner`."
+    )
+
+  kernel_params = make_kernel_params(
+    ctx,
+    len(scalar_args),
+    metaparams,
+    grid,
+    zeroed_outputs,
+    input_output_aliases,
+    configs,
+  )
 
   kernel_calls = []
-  for params in config_params:
+  for params in kernel_params:
     kernel, specialization_attr = get_or_create_triton_kernel(
-        make_gpu_target_func,
-        ctx.module_context.platforms[0],
-        fn,
-        arg_dtypes,
-        scalar_args,
-        num_warps=params["num_warps"],
-        num_stages=params["num_stages"],
-        num_ctas=params["num_ctas"],
-        compute_capability=compute_capability,
-        enable_fp_fusion=enable_fp_fusion,
-        metaparams=dict(params["metaparams"]),
-        dump=debug,
+      make_gpu_target_func,
+      ctx.module_context.platforms[0],
+      fn,
+      arg_dtypes,
+      scalar_args,
+      # num_warps=params["num_warps"],
+      # num_stages=params["num_stages"],
+      # num_ctas=params["num_ctas"],
+      compute_capability=compute_capability,
+      # enable_fp_fusion=metaparams["enable_fp_fusion"],
+      metaparams=dict(params["metaparams"]),
+      # debug=metaparams["debug"],
     )
 
-    kernel_params = []
+    call_params = []
     zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
     equal_to_1 = {i for i, _, v in scalar_args if v == 1}
     for i, (arg, dtype) in enumerate(zip(args, arg_dtypes)):
       if isinstance(arg, core.ShapedArray):
         arg_attrs = specialization_attr[(i,)]
-        kernel_params.append(
+        call_params.append(
             triton_kernel_call_lib.create_array_parameter(
                 zeroed_params_with_sizes.get(i, 0),
                 16 if (["tt.divisibility", 16] in arg_attrs) else 0,
@@ -702,7 +823,7 @@ def triton_kernel_call_lowering(
           arg = int(arg)
         elif isinstance(arg, float):
           arg = float(arg)
-        kernel_params.append(
+        call_params.append(
             triton_kernel_call_lib.create_scalar_parameter(arg, dtype)
         )
 
@@ -712,7 +833,7 @@ def triton_kernel_call_lowering(
             params["grid"][0],
             params["grid"][1],
             params["grid"][2],
-            kernel_params,
+            call_params,
         )
     )
 
@@ -913,7 +1034,7 @@ def triton_call(
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
 
   array_args = []
-  scalar_args = []
+  scalar_args = []  # A better name would be positional_args, but it is longer
   for i, arg in enumerate(flat_args):
     if isinstance(arg, (bool, int, float)):
       scalar_args.append((i, get_triton_type(arg), arg))
@@ -925,6 +1046,15 @@ def triton_call(
   if input_output_aliases is None:
     input_output_aliases = {}
 
+  # Python guarantees the keys don't exist. The original Triton has a single namespace
+  # for both constexprs and backend options, and we're doing the same to unify processing
+  # We are setting defaults here early, since we use values early
+  metaparams["num_warps"] = num_warps if num_warps is not None else 4
+  metaparams["num_stages"] = num_stages if num_stages is not None else 3
+  metaparams["num_ctas"] = num_ctas
+  metaparams["enable_fp_fusion"] = enable_fp_fusion
+  metaparams["debug"] = debug
+
   out_flat = triton_kernel_call_p.bind(
       *array_args,
       fn=kernel,
@@ -933,14 +1063,9 @@ def triton_call(
       custom_call_target_name=custom_call_target_name,
       out_shapes=tuple(flat_out_shapes),
       grid=grid,
-      num_warps=num_warps,
-      num_stages=num_stages,
-      num_ctas=num_ctas,
       compute_capability=compute_capability,
-      enable_fp_fusion=enable_fp_fusion,
       input_output_aliases=tuple(input_output_aliases.items()),
       zeroed_outputs=zeroed_outputs,
-      debug=debug,
       serialized_metadata=serialized_metadata,
       metaparams=tuple(metaparams.items()),
   )
