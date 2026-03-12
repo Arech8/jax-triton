@@ -407,6 +407,10 @@ def get_or_create_triton_kernel(
   # and returns a tuple of 3: 1 is a dict kernel_param_name->value mapping each
   # (positional and key-value) argument name to its value; 2 is a list of
   # specializations; 3 seems to be just forwarding of the options/kwargs/metaparams back.
+  # The dynamically generated binder function exists purely for performance — it avoids
+  # the overhead of inspect.Signature.bind() + apply_defaults() on every kernel launch,
+  # while still computing the specialization tuples from the actual runtime argument
+  # values.
   #
   # Specialization is list[tuple[str, Any]], where first element of tuple is the arg type
   # (or "constexpr" for constants), and the second parameter is the 'specialization'
