@@ -408,9 +408,9 @@ def get_or_create_triton_kernel(
   # (positional and key-value) argument name to its value; 2 is a list of
   # specializations; 3 seems to be just forwarding of the options/kwargs/metaparams back.
   # The dynamically generated binder function exists purely for performance — it avoids
-  # the overhead of inspect.Signature.bind() + apply_defaults() on every kernel launch,
-  # while still computing the specialization tuples from the actual runtime argument
-  # values.
+  # the overhead of branched algo of building the specialization and application of
+  # defaults on every kernel launch, while still computing the specialization tuples
+  # from the actual runtime argument values.
   #
   # Specialization is list[tuple[str, Any]], where first element of tuple is the arg type
   # (or "constexpr" for constants), and the second parameter is the 'specialization'
@@ -426,23 +426,20 @@ def get_or_create_triton_kernel(
   # Also we only specialize runtime arguments (not constexprs!), while their impl does
   # it for everything.
 
-  # problems with the below code:
-  # 1. probably doesn't handle constexprs properly due to a wrong specialize_impl() call
-  # It uses types.SimpleNamespace() instead of actual constexpr argument, and the code
-  # https://github.com/triton-lang/triton/blob/release/3.6.x/python/src/specialize.cc#L491
-  # checks the constexrness by essentially `isinstance()`.
-
-  ##############################
-
   signature = {fn.arg_names[i]: v for i, v in enumerate(arg_dtypes)}
   # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
   # We assume that all arrays are aligned to 16 bytes, and Triton may use this
   # assumption, unless array args are include in the `do_not_specialize` list.
+  #
+  # Note that alignments, specialization and attrs (which are essentially alignment
+  # optimization hints now) make sense and are computed only for positional/nonconstexpr
+  # arguments of the kernel! For constexprs compiler doesn't need this, as it has the
+  # value itself.
   alignments = [16] * len(arg_dtypes)
   for i, _, _ in scalar_args:
     alignments[i] = 0
   specialize_impl = _triton.native_specialize_impl
-  is_const = False # BUG this is wrong! must depend on the param type!
+  is_const = False
   do_specialize = True
   specialization = [
       specialize_impl(
@@ -463,6 +460,7 @@ def get_or_create_triton_kernel(
   constants = dict(metaparams)
   constants.update({k: None for _, k, v in scalar_args if v is None})
   constants.update({fn.arg_names[i]: 1 for i, _, v in scalar_args if v == 1})
+  # adding constexprs info to the signature
   for constant in constants:
     signature[constant] = "constexpr"
 
@@ -593,8 +591,8 @@ def make_autotuner_configs(
   parameters. The pruning eliminates those contradictory configs, reducing compilation
   and benchmarking work.
 
-  Note that our implementation is more permissive than Triton's autotuner implementation, which will
-  throw an error if any keys match.
+  Note that our implementation is more permissive than Triton's autotuner
+  implementation, which will throw an error if any keys match.
   """
   assert isinstance(fn, autotuner.Autotuner)
 
@@ -613,7 +611,7 @@ def make_autotuner_configs(
       if config.pre_hook is not None:
         raise NotImplementedError("`pre_hook` is not supported")
 
-      # Keep the config IIF for every user-provided metaparam (k, v), the config
+      # Keep the config IFF for every user-provided metaparam (k, v), the config
       # either doesn't specify k at all, or specifies the same value v. This ensures
       # the config is coherent with explicit user choices
       if all(config.kwargs.get(k, v) == v for k, v in metaparams.items()):
