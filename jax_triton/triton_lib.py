@@ -405,7 +405,7 @@ def get_or_create_triton_kernel(
   )
 
   # TODO(Arech): triton.runtime.jit.create_function_from_signature() is better here
-  # The binder it generates takes kernel positional argument values (from scalar_args)
+  # The binder it generates takes kernel positional argument values (need to pass args here)
   # and all kwargs passed to the triton's launcher (as options, for us it's metaparams)
   # and returns a tuple of 3: 1 is a dict kernel_param_name->value mapping each
   # (positional and key-value) argument name to its value; 2 is a list of
@@ -442,9 +442,9 @@ def get_or_create_triton_kernel(
   for i, _, _ in scalar_args:
     alignments[i] = 0
   specialize_impl = _triton.native_specialize_impl
-  is_const = False
+  is_const = False  # set as tl.const type hints and marks read-only data
   do_specialize = True
-  specialization = [
+  specialization = tuple(
       specialize_impl(
           backend,
           types.SimpleNamespace(
@@ -455,24 +455,33 @@ def get_or_create_triton_kernel(
           alignment > 0,
       )
       for arg_dtype, alignment in zip(arg_dtypes, alignments)
-  ]
+  )
   attrs = {
       (i,): backend.parse_attr(attr)
       for i, (_, attr) in enumerate(specialization)
   }
 
-  # note that fn already have .constexprs, but it's a todo for removal
-  constexpr_names = (
-    fn.constexprs
-    if hasattr(fn, "constexprs")
-    else [p.name for p in fn.params if p.is_constexpr]
-  )
+  constexpr_names = [p.name for p in fn.params if p.is_constexpr]
 
-  backend_fields = set(type(backend.parse_options({})).__dataclass_fields__.keys())
+  constexprs = { k:v for k,v in metaparams.items() if k in constexpr_names}
+  # note that original Triton passes _all_ arguments (including constexprs) through the
+  # specialization pipeline and that could turn certain runtime vars with value of None
+  # or 1 into constexprs. And then for the purposes of kernel compiling it decides what
+  # constexpr and what isn't from the specialization results only!
+  # We are shortcutting this, but perhaps we shouldn't, since it might make the
+  # behaviour incoherent. Also the shortcutting requiers us to put constexprs into
+  # kernel caching key due to that
 
-  constexprs = dict(metaparams)
-  constexprs.update({k: None for _, k, v in scalar_args if v is None})
-  constexprs.update({fn.arg_names[i]: 1 for i, _, v in scalar_args if v == 1})
+  # None args are treated as constexprs in the original specialize.cc:L481
+  # args==1 are also treated as constexprs IFF specialization is enabled in
+  # specialize.cc:L238. The rationale is that 1s are extremely common as strides or
+  # sizes, so it's very beneficial to compile that as a special case
+  # BUG: a check if specialization is enabled is needed here for test for == 1! Better
+  # use Triton's specialization pipeline and infer constexprs from it instead, return
+  # scalar_args_blacklist indices back to a caller, so they won't be passed as kernel
+  # invocation arguments.
+  constexprs.update({fn.arg_names[i]: v for i, _, v in scalar_args if v == 1 or v is None})
+
   # adding constexprs info to the signature
   for constant in constexprs:
     signature[constant] = "constexpr"
@@ -480,14 +489,18 @@ def get_or_create_triton_kernel(
   # Cache key should contain any parameter that can affect the compiler output.
   cache_key = (
       fn,
-      tuple(signature.items()),
-      tuple(specialization),
+      # tuple(signature.items()),
+      specialization,
+
+      # TODO fix this either by using a full specialization, or shorten to only use
+      # added to constexprs vars
       tuple(constexprs.items()),
-      num_warps,
-      num_stages,
-      num_ctas,
+      #num_warps,
+      #num_stages,
+      #num_ctas,
       compute_capability,
-      enable_fp_fusion,
+      #enable_fp_fusion,
+      tuple(metaparams.items()),
   )
   kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
 
@@ -505,13 +518,9 @@ def get_or_create_triton_kernel(
         "implicit output arguments are no longer required for aliased args."
       )
 
-    opts = {
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "num_ctas": num_ctas,
-        "debug": metaparams["debug"],
-        "enable_fp_fusion": enable_fp_fusion,
-    }
+    # TODO b4 PR fix this
+    backend_fields = frozenset(type(backend.parse_options({})).__dataclass_fields__.keys())
+    opts = { k:v for k,v in metaparams.items() if k in backend_fields}
 
     options = backend.parse_options(opts)
 
@@ -667,8 +676,8 @@ def extract_avals(
   scalar_args: tuple[tuple[int, str, Any], ...],
   input_output_aliases: dict[int, int],
 ) -> tuple[list[Any], list[str]]:
-  """ Extract abstract values and their dtypes from the context."""
-
+  """ Extract all arguments' abstract values and their dtypes from the context."""
+  # TODO: this requires an assumption that scalars must go after inputs before outputs
   args = list(ctx.avals_in)
   arg_dtypes = list(map(get_triton_type, ctx.avals_in))
   for idx, dtype, v in scalar_args:
@@ -707,10 +716,15 @@ def make_kernel_params(
   kernel_params = []
   for config in configs:
     config_metaparams = {**metaparams, **config.kwargs}
-    # sanity checks to ensure no divergence had happened
-    assert config_metaparams["num_warps"] == config.num_warps
-    assert config_metaparams["num_stages"] == config.num_stages
-    assert config_metaparams["num_ctas"] == config.num_ctas
+    # filling back backend related config params
+    config_metaparams["num_warps"] = config.num_warps
+    config_metaparams["num_stages"] = config.num_stages
+    config_metaparams["num_ctas"] = config.num_ctas
+    if config.maxnreg is None:
+      if "maxnreg" in config_metaparams:
+        del config_metaparams["maxnreg"]
+    else:
+      config_metaparams["maxnreg"] = config.maxnreg
 
     config_grid = normalize_grid(grid, config_metaparams)
 
@@ -769,20 +783,20 @@ def triton_kernel_call_lowering(
   ), "num_warps, num_stages, and num_ctas must be integers"
 
   args, arg_dtypes = extract_avals(ctx, scalar_args, input_output_aliases)
-
+  # note that args here mean only *positional* args
   named_args = dict(unsafe_zip(fn.arg_names, args))
 
   if isinstance(fn, autotuner.Autotuner):
     configs, fn = make_autotuner_configs(fn, scalar_args, metaparams, named_args)
   else:
-    configs = [
-      triton.Config(
-        {},
-        num_warps=metaparams["num_warps"],
-        num_stages=metaparams["num_stages"],
-        num_ctas=metaparams["num_ctas"],
-      )
-    ]
+    ttcfg_args = dict(
+      num_warps=metaparams["num_warps"],
+      num_stages=metaparams["num_stages"],
+      num_ctas=metaparams["num_ctas"],
+    )
+    if "maxnreg" in metaparams:
+      ttcfg_args["maxnreg"] = metaparams["maxnreg"]
+    configs = [triton.Config({}, **ttcfg_args)]
 
   if isinstance(fn, autotuner.Heuristics):
     configs, fn = make_configs_from_heuristics(fn, configs, metaparams, named_args)
@@ -821,7 +835,8 @@ def triton_kernel_call_lowering(
 
     call_params = []
     zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
-    equal_to_1 = {i for i, _, v in scalar_args if v == 1}
+
+    equal_to_1_or_None = {i for i, _, v in scalar_args if v == 1 or v is None}
     for i, (arg, dtype) in enumerate(zip(args, arg_dtypes)):
       if isinstance(arg, core.ShapedArray):
         arg_attrs = specialization_attr[(i,)]
@@ -831,7 +846,7 @@ def triton_kernel_call_lowering(
                 16 if (["tt.divisibility", 16] in arg_attrs) else 0,
             )
         )
-      elif i not in equal_to_1:
+      elif i not in equal_to_1_or_None:
         # Convert TypedInt/TypedFloat subclasses to plain Python types,
         # as nanobind's strict-mode integer caster rejects subclasses.
         if isinstance(arg, bool):
@@ -855,6 +870,7 @@ def triton_kernel_call_lowering(
     )
 
   if len(kernel_calls) > 1:
+    # TODO: test how this handles scalar_args with 1s and None-s
     named_scalar_args = {fn.arg_names[i]: v for i, _, v in scalar_args}
     input_output_aliases_with_sizes = tuple(
         (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
@@ -1051,11 +1067,13 @@ def triton_call(
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
 
   array_args = []
-  scalar_args = []  # A better name would be positional_args, but it is longer
+  scalar_args = []  # these are *positional* scalar args
   for i, arg in enumerate(flat_args):
-    if isinstance(arg, (bool, int, float)):
+    if arg is None: # None's are turned into constexprs
+      scalar_args.append((i, "constexpr", None))
+    elif isinstance(arg, (bool, int, float)):
       scalar_args.append((i, get_triton_type(arg), arg))
-    elif isinstance(arg, np.float32):
+    elif isinstance(arg, (np.float32, np.float64)):
       scalar_args.append((i, get_triton_type(arg), float(arg)))
     else:
       array_args.append(arg)
