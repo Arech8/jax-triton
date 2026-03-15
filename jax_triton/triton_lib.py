@@ -835,6 +835,8 @@ def triton_kernel_call_lowering(
 
     call_params = []
     zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
+    
+    # TODO how does it handle positional scalars in random positions?
 
     equal_to_1_or_None = {i for i, _, v in scalar_args if v == 1 or v is None}
     for i, (arg, dtype) in enumerate(zip(args, arg_dtypes)):
