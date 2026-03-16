@@ -382,6 +382,7 @@ def get_or_create_triton_kernel(
   make_gpu_target_func,
   platform: str,
   fn: triton.JITFunction | gl_runtime.GluonJITFunction,
+  args: list[Any],
   arg_dtypes: list[str],
   scalar_args: tuple[tuple[int, str, Any], ...],
   *,
@@ -435,7 +436,7 @@ def get_or_create_triton_kernel(
   # assumption, unless array args are include in the `do_not_specialize` list.
   #
   # Note that alignments, specialization and attrs (which are essentially alignment
-  # optimization hints now) make sense and are computed only for positional/nonconstexpr
+  # optimization hints now) make sense and are computed only for positional/non-constexpr
   # arguments of the kernel! For constexprs compiler doesn't need this, as it has the
   # value itself.
   alignments = [16] * len(arg_dtypes)
@@ -449,16 +450,20 @@ def get_or_create_triton_kernel(
           backend,
           types.SimpleNamespace(
               data_ptr=lambda: alignment, dtype=arg_dtype.removeprefix("*")
-          ),
+          ) if alignment>0 else arg_value,
           is_const,
           do_specialize,
           alignment > 0,
       )
-      for arg_dtype, alignment in zip(arg_dtypes, alignments)
+      for arg_dtype, alignment, arg_value in zip(arg_dtypes, alignments, args)
   )
+  # TODO now it might be out of sync with how we process constexprs. Fix this by improving
+  # specialization and getting constexpr status from it.
   attrs = {
       (i,): backend.parse_attr(attr)
-      for i, (_, attr) in enumerate(specialization)
+      for i, (_, attr) in enumerate(specialization) if isinstance(attr, str)
+      # attr could be None if specialization is disabled, or when an arg value is None.
+      # Attributes for these doesn't make sense, and the upstream uses a similar check.
   }
 
   constexpr_names = [p.name for p in fn.params if p.is_constexpr]
@@ -468,15 +473,15 @@ def get_or_create_triton_kernel(
   # specialization pipeline and that could turn certain runtime vars with value of None
   # or 1 into constexprs. And then for the purposes of kernel compiling it decides what
   # constexpr and what isn't from the specialization results only!
-  # We are shortcutting this, but perhaps we shouldn't, since it might make the
-  # behaviour incoherent. Also the shortcutting requiers us to put constexprs into
+  # We are short-cutting this, but perhaps we shouldn't, since it might make the
+  # behavior incoherent. Also the short-cutting requires us to put constexprs into
   # kernel caching key due to that
 
   # None args are treated as constexprs in the original specialize.cc:L481
   # args==1 are also treated as constexprs IFF specialization is enabled in
   # specialize.cc:L238. The rationale is that 1s are extremely common as strides or
   # sizes, so it's very beneficial to compile that as a special case
-  # BUG: a check if specialization is enabled is needed here for test for == 1! Better
+  # TODO: a check if specialization is enabled is needed here for test for == 1! Better
   # use Triton's specialization pipeline and infer constexprs from it instead, return
   # scalar_args_blacklist indices back to a caller, so they won't be passed as kernel
   # invocation arguments.
@@ -822,6 +827,7 @@ def triton_kernel_call_lowering(
       make_gpu_target_func,
       ctx.module_context.platforms[0],
       fn,
+      args,
       arg_dtypes,
       scalar_args,
       # num_warps=params["num_warps"],
@@ -835,7 +841,7 @@ def triton_kernel_call_lowering(
 
     call_params = []
     zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
-    
+
     # TODO how does it handle positional scalars in random positions?
 
     equal_to_1_or_None = {i for i, _, v in scalar_args if v == 1 or v is None}
@@ -1064,12 +1070,36 @@ def triton_call(
   out_shape = tree_util.tree_map(
       lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
-  flat_args, _ = tree_util.tree_flatten(args)
+  
+  # flat_args, _ = tree_util.tree_flatten(args)
+  #flat_args = list(args)
+  flat_args = args
+  # TODO discuss this on the PR review.
+  # The problem with tree_util.tree_flatten(args) is that is swallows None which is
+  # a perfectly legitimate value to pass to a kernel. This seems to be solvable (not
+  # sure though, 100% correctly) by adding `is_leaf=lambda x: x is None` argument to the
+  # call. Another (IMHO better) option is to use a special implementation that
+  # explicitly allows None's, such as `none_leaf_registry.flatten(args)` taken from
+  # `from jax._src.tree_util import none_leaf_registry`, but that relies on unstable
+  # internals, which is fragile.
+  #
+  # But there's a bigger and more important problem - flattening args changes
+  # the semantic of kernel arguments: if a user uses, say a tuple of values as a kernel
+  # argument, their intent doesn't look like they want to have it to supply values for
+  # several kernel parameters. It looks like an intent to pass the tuple as a value of
+  # one single parameter, which is consistent with how Python works. But consider this:
+  # `jax.tree_util.tree_flatten((1,2,(5,6)))` yields a flat `[1, 2, 5, 6]`, so what
+  # initially were 3 values for 3 kernel parameters, now 4 values for 4 kernel
+  # parameters. This doesn't look like what the user intended to achieve at all.
+  # Hence, I think the best solution is to just leave it as is.
+
+
   # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
 
   array_args = []
   scalar_args = []  # these are *positional* scalar args
+  # TODO(Arech) b4 the PR, is it better to transform it to a "struct of arrays" form?
   for i, arg in enumerate(flat_args):
     if arg is None: # None's are turned into constexprs
       scalar_args.append((i, "constexpr", None))
@@ -1078,6 +1108,9 @@ def triton_call(
     elif isinstance(arg, (np.float32, np.float64)):
       scalar_args.append((i, get_triton_type(arg), float(arg)))
     else:
+      assert not isinstance(arg, (tuple, list, dict)), (
+        "triton_call does not support pytrees"
+      )
       array_args.append(arg)
 
   if input_output_aliases is None:

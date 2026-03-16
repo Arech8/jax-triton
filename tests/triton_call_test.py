@@ -292,6 +292,52 @@ class TritonKernelCallTest(parameterized.TestCase):
     x = jnp.array([1.0])
     np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
 
+  @parameterized.product(
+    mul=[None, 1, 1.0, 3.14],
+    ofs=[None, 1, 1.0, 2.71],
+    numel=[1, 5, 255, 256, 257, 1024],
+    block_size=[1, 32, 256],
+  )
+  def test_scalar_ordering_1None(self, mul, ofs, numel, block_size):
+    """Test that the order of passing scalars doesn't not matter, as well as that
+    special values of 1 and None for runtime arguments are handled correctly.
+    Since most kernels here follow `inputs first, then scalars` scheme, this only needs
+    to test the reverse order of that. Also checking special cases of 1 and None."""
+
+    @triton.jit
+    def affine_kernel(mul, ofs, in_ptr, in_numel, out_ptr, BLOCK_SIZE: tl.constexpr):
+      pid = tl.program_id(0)
+      start = pid * BLOCK_SIZE
+      end = min(start + BLOCK_SIZE, in_numel)
+      for i in range(start, end):
+        x = tl.load(in_ptr + i)
+        if mul is not None:
+          x *= mul
+        if ofs is not None:
+          x += ofs
+        tl.store(out_ptr + i, x)
+
+    def affine(mul, ofs, x, BLOCK_SIZE):
+      return jt.triton_call(
+        mul,
+        ofs,
+        x,
+        x.size,
+        kernel=affine_kernel,
+        out_shape=x,
+        grid=(triton.cdiv(x.size, BLOCK_SIZE),),
+        BLOCK_SIZE=BLOCK_SIZE,
+      )
+
+    x = jnp.arange(numel, dtype=jnp.float32)
+    y = affine(mul, ofs, x, block_size)
+    expected = x
+    if mul is not None:
+      expected *= mul
+    if ofs is not None:
+      expected += ofs
+    np.testing.assert_allclose(y, expected, rtol=2e-07)
+
   def test_explicit_compute_capability(self):
     scalar = np.float32(8)
 
