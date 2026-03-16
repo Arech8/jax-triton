@@ -278,6 +278,7 @@ def run_benchmarks(
   export_path_pfx: str | None = None,
   clear_cache: bool = True,
   batch_functions: bool = False,
+  pvalue_stats_bootstrap: int = 1000,
 ):
   global _single_gemm, _random_inputs
   _single_gemm = single_gemm
@@ -356,6 +357,7 @@ def run_benchmarks(
     alt_delimiter="|",
     metrics={"mean": np.mean, "median": np.median, "min": np.min},
     console=console,
+    pvalue_stats_bootstrap=pvalue_stats_bootstrap,
   )
 
   end = time.perf_counter_ns()
@@ -415,6 +417,7 @@ def main():
     single_gemm=args.single_gemm,
     random_inputs=args.random_inputs,
     clear_cache=args.clear_cache,
+    pvalue_stats_bootstrap=args.pvalue_stats_bootstrap,
   )
 
 
