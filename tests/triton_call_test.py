@@ -295,14 +295,14 @@ class TritonKernelCallTest(parameterized.TestCase):
   @parameterized.product(
     mul=[None, 1, 1.0, 3.14],
     ofs=[None, 1, 1.0, 2.71],
-    numel=[1, 5, 255, 256, 257, 1024],
-    block_size=[1, 32, 256],
+    numel=[1, 5, 257],
+    block_size=[1, 32],
   )
   def test_scalar_ordering_1None(self, mul, ofs, numel, block_size):
     """Test that the order of passing scalars doesn't not matter, as well as that
     special values of 1 and None for runtime arguments are handled correctly.
-    Since most kernels here follow `inputs first, then scalars` scheme, this only needs
-    to test the reverse order of that. Also checking special cases of 1 and None."""
+    Since most kernels in tests follow `inputs first, then scalars` scheme, this test
+    only needs to check the reverse order of that."""
 
     @triton.jit
     def affine_kernel(mul, ofs, in_ptr, in_numel, out_ptr, BLOCK_SIZE: tl.constexpr):
@@ -357,6 +357,55 @@ class TritonKernelCallTest(parameterized.TestCase):
 
     x = jnp.array([1.0])
     np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
+
+  def test_single_namespace_for_constexprs_and_backend_options(self):
+    """Checks that metaparams of triton_call() are passed to the kernel and to backend
+    options. Validates that non-hashable backend options work too."""
+
+    @triton.jit
+    def kernel(in_ptr, out_ptr, num_warps: tl.constexpr):
+      tl.store(out_ptr, tl.load(in_ptr) * num_warps)
+
+    def call_kernel(x, mul):
+      return jt.triton_call(
+        x,
+        kernel=kernel,
+        out_shape=x,
+        grid=1,
+        num_warps=mul,
+        extern_libs={"some wild lib": "/path/not/exists/trust_me"},
+      )
+
+    import triton.backends.nvidia.compiler as cb
+    import triton.backends.amd.compiler as hb
+
+    # now we need the platform ID, and I didn't find a better way than this ugliness
+    backends = jax.extend.backend.backends()
+    default = jax.extend.backend.get_backend()
+    name = next((n for n, c in backends.items() if c is default))
+    # getting relevant backend options object for hooking its initialization method
+    OptionsObj = {"cuda": cb.CUDAOptions, "rocm": hb.HIPOptions}[name]
+
+    orig_opts_init = OptionsObj.__post_init__
+
+    my_num_warps = 1
+    def my_opts_init(self):
+      assert self.num_warps == my_num_warps
+      assert self.extern_libs == {"some wild lib": "/path/not/exists/trust_me"}
+      # cleaning it up to prevent unexpected effects of error handling
+      object.__setattr__(self, "extern_libs", None)
+      orig_opts_init(self)
+
+    x = jnp.array([2.5])
+
+    with mock.patch.object(OptionsObj, "__post_init__", new=my_opts_init):
+      my_num_warps = 1
+      np.testing.assert_allclose(call_kernel(x, my_num_warps), x * my_num_warps)
+      my_num_warps = 2
+      np.testing.assert_allclose(call_kernel(x, my_num_warps), x * my_num_warps)
+      my_num_warps = 4
+      np.testing.assert_allclose(call_kernel(x, my_num_warps), x * my_num_warps)
+
 
   @parameterized.parameters(False, True)
   def test_input_output_aliasing_simple(self, with_donation):

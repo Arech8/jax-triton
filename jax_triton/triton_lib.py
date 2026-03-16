@@ -378,6 +378,12 @@ def make_backend(
 _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
 
 
+_BACKEND_OPTIONS_FIELD_NAMES = {
+  "cuda": frozenset(cb.CUDAOptions.__dataclass_fields__.keys()),
+  "hip": frozenset(hb.HIPOptions.__dataclass_fields__.keys()),
+}
+
+
 def get_or_create_triton_kernel(
   make_gpu_target_func,
   platform: str,
@@ -457,8 +463,9 @@ def get_or_create_triton_kernel(
       )
       for arg_dtype, alignment, arg_value in zip(arg_dtypes, alignments, args)
   )
-  # TODO now it might be out of sync with how we process constexprs. Fix this by improving
-  # specialization and getting constexpr status from it.
+  # TODO now by passing actual value for a scalar it might be out of sync with how we
+  # process constexprs. Fix this by improving specialization and getting constexpr status from it.
+
   attrs = {
       (i,): backend.parse_attr(attr)
       for i, (_, attr) in enumerate(specialization) if isinstance(attr, str)
@@ -505,7 +512,8 @@ def get_or_create_triton_kernel(
       #num_ctas,
       compute_capability,
       #enable_fp_fusion,
-      tuple(metaparams.items()),
+      #tuple(metaparams.items()),
+      str(metaparams), # might be unhashable. Upstream does str()
   )
   kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
 
@@ -523,8 +531,7 @@ def get_or_create_triton_kernel(
         "implicit output arguments are no longer required for aliased args."
       )
 
-    # TODO b4 PR fix this
-    backend_fields = frozenset(type(backend.parse_options({})).__dataclass_fields__.keys())
+    backend_fields = _BACKEND_OPTIONS_FIELD_NAMES[gpu_target.backend]
     opts = { k:v for k,v in metaparams.items() if k in backend_fields}
 
     options = backend.parse_options(opts)
@@ -777,8 +784,8 @@ def triton_kernel_call_lowering(
 ):
   # we have to pass metaparams dictionary as a tuple to allow hashing necessary for
   # lowering via xla_primitive_callable()
-  assert isinstance(metaparams, tuple), "metaparams must be tuple[tuple[str, Any], ...]"
-  metaparams = dict[str, Any](metaparams)
+  metaparams = from_hashable_metaparams(metaparams)
+
   assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
   input_output_aliases = dict[int,int](input_output_aliases)
 
@@ -950,6 +957,30 @@ class ShapeDtype(Protocol):
   @property
   def dtype(self) -> np.dtype:
     ...
+
+
+def to_hashable_metaparams(metaparams: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+  """Converts metaparams to a tuple so it could be hashable while caring for certain
+  keys this are known to be unhashable."""
+  # Triton doesn't support passing unhashable values as metaparams, however, these
+  # metaparams might also contain backend options, and some of them are dicts. So far,
+  # there's only one such option - `extern_libs`, both in AMD and NVIDIA backends.
+  # While it might be possible to use `tree_util.tree_flatten(metaparams)` here, it's
+  # too expensive for handling such a rare case. Instead, we do this manually.
+  # This is somewhat fragile and might require some maintenance to adapt to new options
+  # but the kernel launcher is a hot path, so this seem tolerable.
+  if "extern_libs" in metaparams:
+    metaparams["extern_libs"] = tuple(metaparams["extern_libs"].items())
+  return tuple(metaparams.items())
+
+
+def from_hashable_metaparams(astuple: tuple[tuple[str, Any], ...]) -> dict[str, Any]:
+  """Converts a tuple of metaparams back to a dictionary."""
+  assert isinstance(astuple, tuple), "astuple must be a tuple of metaparam items"
+  metaparams = dict(astuple)
+  if "extern_libs" in metaparams:
+    metaparams["extern_libs"] = dict(metaparams["extern_libs"])
+  return metaparams
 
 
 def triton_call(
@@ -1137,6 +1168,6 @@ def triton_call(
       input_output_aliases=tuple(input_output_aliases.items()),
       zeroed_outputs=zeroed_outputs,
       serialized_metadata=serialized_metadata,
-      metaparams=tuple(metaparams.items()),
+      metaparams=to_hashable_metaparams(metaparams),
   )
   return tree_util.tree_unflatten(out_tree, out_flat)
