@@ -705,10 +705,7 @@ def make_autotuner_configs(
   scalar_args: tuple[tuple[int, str, Any], ...],
   metaparams: dict[str, Any],
   named_args: dict[str, Any],
-) -> tuple[
-  list[triton.Config],
-  autotuner.Heuristics | triton.JITFunction | gl_runtime.GluonJITFunction,
-]:
+) -> list[triton.Config]:
   """ Make and prune redundant autotuner configs based on user-provided metaparams.
 
   If any metaparams have been specified explicitly, we prune any configs that conflict.
@@ -765,10 +762,7 @@ def make_configs_from_heuristics(
   configs: list[triton.Config],
   metaparams: dict[str, Any],
   named_args: dict[str, Any],
-) -> tuple[
-  list[triton.Config],
-  triton.JITFunction | gl_runtime.GluonJITFunction,
-]:
+) -> list[triton.Config]:
   """Applies heuristics to the configs and returns the updated configs and the function."""
   assert isinstance(fn, autotuner.Heuristics)
 
