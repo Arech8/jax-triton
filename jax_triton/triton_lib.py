@@ -20,6 +20,7 @@ from collections.abc import Callable, Sequence
 import copy
 import dataclasses
 import functools
+import inspect
 import os
 import pprint
 import tempfile
@@ -133,9 +134,13 @@ def get_triton_type(obj: Any) -> str:
     else:
       raise ValueError(f"integer overflow representing {obj}")
   if isinstance(obj, float):
-    return "fp64"
+    # Triton proper unconditionally treat all floats as fp32, so we should too.
+    # If one wants fp64, they should use it explicitly with np.float64.
+    return "fp32"
   if isinstance(obj, np.float32):
     return "fp32"
+  if isinstance(obj, np.float64):
+    return "fp64"
   if isinstance(obj, str):
     return "str"
   raise NotImplementedError(
@@ -378,6 +383,95 @@ def make_backend(
 _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
 
 
+#################################### FOR RESEARCH ONLY
+def create_function_from_signature(sig, kparams, backend):
+    """
+    - sig is fn.signature, result of inspect.signature(fn)
+    - kparams is fn.params, a list of KernelParam objects
+    - backend is the triton backend object
+
+    Equivalent to sig.bind followed by apply_defaults. This generates a
+    native Python function (using exec) which can be memoized on a per-kernel
+    basis to avoid having to run these expensive functions -- which constitute
+    much of the kernel launch overhead -- every time we run the kernel.
+    """
+    assert len(sig.parameters) == len(kparams)
+    # Create the function argument list and the dict entries for the return statement
+    specialization = []
+    # signature
+    for name, kp in zip(sig.parameters.keys(), kparams):
+        if kp.is_constexpr:
+            specialization.append(f'("constexpr", {name})')
+            # TODO warn if specialization is disallowed
+            # for constexpr functions results are different from what specialize_impl() returns
+            # but due two 2-phase cache key resolution and work of replace_callables(),
+            # the caching ends up being correct. (but still need to test both func passing
+            # variants)
+        else:
+            is_const = 'True' if kp.is_const else 'False'
+            specialize = 'False' if kp.do_not_specialize else 'True'
+            align = 'False' if kp.do_not_specialize_on_alignment else 'True'
+            ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
+            # note that runtime specialization might generate strings for some values
+            # such as callables, which, if not handled carefully, might produce wrong
+            # attributes later, since `parse_attr(desc)` only checks if the string
+            # description has certain characters.
+            # TODO: how to "fake" callables during tracing time?
+            if kp.annotation_type:
+                if isinstance(kp.annotation_type, str):
+                    if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
+                        # we do not specialize non-constexpr floats and bools:
+                        specialize = False
+                if specialize:
+                    specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
+                else:
+                    # skip runtime specialization:
+                    specialization.append(f'("{kp.annotation_type}", None)')
+            else:
+                specialization.append(f"{ret}")
+
+    # compute argument string for a given parameter
+    arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
+    # arg returns a func signature argument declaration reconstructed from the original func
+    # signature - either a param name if it has no default, or param=default_val otherwise
+
+    func_body = f"""
+def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options"])}):
+    params = {{{', '.join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
+    specialization = [{','.join(specialization)}]
+    return params, specialization, options
+"""
+    # order of the func params declaration is determined by the fn signature and then a
+    # blank **options: e.g. "a_ptr, b_ptr, ..., BLOCK_SIZE_M, num_warps, waves_per_eu, ..., **options"
+    #
+    # params var is just a dict mapping fn param name to its value, using the sig object again, e.g.:
+    # "{'a_ptr': a_ptr, ..., 'BLOCK_SIZE_M': BLOCK_SIZE_M, 'num_warps': num_warps, 'waves_per_eu': waves_per_eu, ...}"
+    # We call this named_args and use it very early.
+    #
+    # specialization is a list constructed from either pre-created specialization strings,
+    # or from the result of calling specialize_impl() for each non-constexpr param.
+    # Specializations are used later to extract additional constexprs
+
+    # Prepare defaults to be inserted into function namespace
+    func_namespace = {
+        f"default_{name}": param.default
+        for name, param in sig.parameters.items()
+        if param.default is not inspect.Parameter.empty
+    }
+
+    specialize_impl = _triton.native_specialize_impl
+    func_namespace["specialize_impl"] = specialize_impl
+    func_namespace["backend"] = backend
+    func_namespace["JITCallable"] = triton.runtime.jit.JITCallable
+
+    # Execute the function string in func_namespace to create the function
+    exec(func_body, func_namespace)
+
+    # Extract the newly created function from the namespace
+    return func_namespace['dynamic_func']
+#################################### END of FOR RESEARCH ONLY
+
+
 _BACKEND_OPTIONS_FIELD_NAMES = {
   "cuda": frozenset(cb.CUDAOptions.__dataclass_fields__.keys()),
   "hip": frozenset(hb.HIPOptions.__dataclass_fields__.keys()),
@@ -427,7 +521,8 @@ def get_or_create_triton_kernel(
   # value which is an attribute designed to trigger a separately compiled kernel variant
   # for that specific argument value (it let chose a specific compiled kernel that's
   # best for argument value and its alignment; such as special cases for constexprs,
-  # ones, and values divisible by 16)
+  # ones, and values divisible by 16). Note that in certain cases, the specialization
+  # value might be a hash string (hopefully!!! lowercase), such as for callables.
   #
   # Their implementation handle params better, but we likely can't use their code since
   # they supply an argument value to specialize_impl() directly, while we can't do it
@@ -656,8 +751,13 @@ def make_autotuner_configs(
 
   fn.early_config_prune = prune_configs
   fn.nargs = named_args
+  # TODO(Arech) if user has specified perf_model or early_config_prune functions in
+  # prune_configs_by dict when was instantiating the autotuner, prune_configs() will
+  # call each of it passing named_args to it. However, internally, the autotuner
+  # constructs .nargs using only positional arguments provided in a similar way, so at
+  # least currently there seems to be no divergence.
   configs = fn.prune_configs(metaparams)
-  return configs, fn.fn
+  return configs
 
 
 def make_configs_from_heuristics(
@@ -680,7 +780,7 @@ def make_configs_from_heuristics(
     updated_config = copy.copy(config)
     updated_config.kwargs = kwargs
     updated_configs.append(updated_config)
-  return updated_configs, fn.fn
+  return updated_configs
 
 
 def extract_avals(
@@ -688,8 +788,7 @@ def extract_avals(
   scalar_args: tuple[tuple[int, str, Any], ...],
   input_output_aliases: dict[int, int],
 ) -> tuple[list[Any], list[str]]:
-  """ Extract all arguments' abstract values and their dtypes from the context."""
-  # TODO: this requires an assumption that scalars must go after inputs before outputs
+  """ Extract all arguments' abstract values and their Triton types from the context."""
   args = list(ctx.avals_in)
   arg_dtypes = list(map(get_triton_type, ctx.avals_in))
   for idx, dtype, v in scalar_args:
@@ -789,17 +888,33 @@ def triton_kernel_call_lowering(
   assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
   input_output_aliases = dict[int,int](input_output_aliases)
 
-  # if it fires, it's a programmer's mistake and no exception handling could fix that
+  # if it fires, it's a programmer's mistake and no exception handling could fix that.
+  # This is basically to validate the fields were set earlier in triton_call()
   assert all(
     isinstance(metaparams[k], int) for k in ("num_warps", "num_stages", "num_ctas")
   ), "num_warps, num_stages, and num_ctas must be integers"
 
   args, arg_dtypes = extract_avals(ctx, scalar_args, input_output_aliases)
-  # note that args here mean only *positional* args
-  named_args = dict(unsafe_zip(fn.arg_names, args))
+  # args here mean only positional i.e. non-constexpr args, including scalars.
+
+  if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
+    # named_args are needed only for Autotuner/Heuristics handling.
+    #
+    # Warning: fn.arg_names is deprecated and is scheduled for removal everywhere as per
+    # comment in JITFunction code. It's however a part of public API of the Autotuner
+    # and Heuristics classes, and it is unclear how they are going to get rid of it.
+    # Doesn't exclude though that this still might break eventually.
+    named_args = dict(unsafe_zip(fn.arg_names, args))
+    # note that the above construction of named_args is based on positional args only.
+    # This is fully coherent with how upstream does it in Autotuner/Heuristics classes.
+    # These are genuinely name-value pairs for passed positional arguments only, and not
+    # `bound_args` constructed using kernel's signature.
 
   if isinstance(fn, autotuner.Autotuner):
-    configs, fn = make_autotuner_configs(fn, scalar_args, metaparams, named_args)
+    # We should unpack autotuner first and heuristics second to ensure we'd
+    # eventually get to a correct actual kernel `fn`.
+    configs = make_autotuner_configs(fn, scalar_args, metaparams, named_args)
+    fn = fn.fn
   else:
     ttcfg_args = dict(
       num_warps=metaparams["num_warps"],
@@ -811,7 +926,8 @@ def triton_kernel_call_lowering(
     configs = [triton.Config({}, **ttcfg_args)]
 
   if isinstance(fn, autotuner.Heuristics):
-    configs, fn = make_configs_from_heuristics(fn, configs, metaparams, named_args)
+    configs = make_configs_from_heuristics(fn, configs, metaparams, named_args)
+    fn = fn.fn
 
   if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
     raise ValueError(
@@ -1103,10 +1219,10 @@ def triton_call(
   )
   
   # flat_args, _ = tree_util.tree_flatten(args)
-  #flat_args = list(args)
   flat_args = args
   # TODO discuss this on the PR review.
-  # The problem with tree_util.tree_flatten(args) is that is swallows None which is
+  # The are 2 problems with tree_util.tree_flatten(args):
+  # First is that is swallows None which is
   # a perfectly legitimate value to pass to a kernel. This seems to be solvable (not
   # sure though, 100% correctly) by adding `is_leaf=lambda x: x is None` argument to the
   # call. Another (IMHO better) option is to use a special implementation that
@@ -1114,7 +1230,7 @@ def triton_call(
   # `from jax._src.tree_util import none_leaf_registry`, but that relies on unstable
   # internals, which is fragile.
   #
-  # But there's a bigger and more important problem - flattening args changes
+  # But there's a bigger and more important second problem - flattening args changes
   # the semantic of kernel arguments: if a user uses, say a tuple of values as a kernel
   # argument, their intent doesn't look like they want to have it to supply values for
   # several kernel parameters. It looks like an intent to pass the tuple as a value of
@@ -1122,8 +1238,10 @@ def triton_call(
   # `jax.tree_util.tree_flatten((1,2,(5,6)))` yields a flat `[1, 2, 5, 6]`, so what
   # initially were 3 values for 3 kernel parameters, now 4 values for 4 kernel
   # parameters. This doesn't look like what the user intended to achieve at all.
-  # Hence, I think the best solution is to just leave it as is.
-
+  # Triton explicitly allows to pass tuples as kernel args value, so this is definitely
+  # a compatibility bug.
+  # Hence, I think the best solution is to just leave it as is for now and fix tuple
+  # lowering later.
 
   # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
@@ -1139,6 +1257,10 @@ def triton_call(
     elif isinstance(arg, (np.float32, np.float64)):
       scalar_args.append((i, get_triton_type(arg), float(arg)))
     else:
+      # TODO(Arech) we need and could have lowering of tuples/lists similarly to how
+      # Triton does this (lists are silently converted to tuples) and this should work
+      # well with our launcher backend if done carefully, but this is a large and
+      # complex change, so postponing it to the next PR.
       assert not isinstance(arg, (tuple, list, dict)), (
         "triton_call does not support pytrees"
       )
