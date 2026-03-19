@@ -20,6 +20,7 @@ from collections.abc import Callable, Sequence
 import copy
 import dataclasses
 import functools
+from functools import cached_property
 import inspect
 import os
 import pprint
@@ -44,27 +45,16 @@ import jax.numpy as jnp
 import numpy as np
 
 
-CAN_USE_TRITON = False
-try:
-  import triton
-  from triton.compiler import compiler as tc
-  import triton.language as tl
-  from triton.runtime import autotuner
-  import triton._C.libtriton as _triton
-  import triton.backends.nvidia.compiler as cb
+import triton
+from triton.compiler import compiler as tc
+import triton.language as tl
+from triton.runtime import autotuner
+import triton._C.libtriton as _triton
+import triton.backends.nvidia.compiler as cb
+import triton.backends.amd.compiler as hb
 
-  import triton.experimental.gluon._runtime as gl_runtime
-  from triton.experimental.gluon import language as gl
-
-  CAN_USE_TRITON = True
-except ModuleNotFoundError:
-  pass
-
-try:
-  import triton.backends.amd.compiler as hb
-except ImportError:
-  hb = None
-  pass
+import triton.experimental.gluon._runtime as gl_runtime
+from triton.experimental.gluon import language as gl
 
 
 os.environ["TRITON_CACHE_DIR"] = ""
@@ -116,7 +106,8 @@ def avals_to_layouts(avals):
 
 
 def get_triton_type(obj: Any) -> str:
-  if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
+  # if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
+  if hasattr(obj, "dtype"):
     return f"*{_JAX_TO_TRITON_TYPE_MAP[obj.dtype]}"
   if isinstance(obj, (tl.constexpr, gl.constexpr)):
     obj = obj.value
@@ -137,10 +128,14 @@ def get_triton_type(obj: Any) -> str:
     # Triton proper unconditionally treat all floats as fp32, so we should too.
     # If one wants fp64, they should use it explicitly with np.float64.
     return "fp32"
-  if isinstance(obj, np.float32):
+  
+  """if isinstance(obj, np.float32):
     return "fp32"
   if isinstance(obj, np.float64):
     return "fp64"
+  if isinstance(obj, np.float16):
+    return "fp16"""
+
   if isinstance(obj, str):
     return "str"
   raise NotImplementedError(
@@ -484,7 +479,7 @@ def get_or_create_triton_kernel(
   fn: triton.JITFunction | gl_runtime.GluonJITFunction,
   args: list[Any],
   arg_dtypes: list[str],
-  scalar_args: tuple[tuple[int, str, Any], ...],
+  scalar_args: dict[int, Any],
   *,
   # num_warps,
   # num_stages,
@@ -516,13 +511,24 @@ def get_or_create_triton_kernel(
   # defaults on every kernel launch, while still computing the specialization tuples
   # from the actual runtime argument values.
   #
-  # Specialization is list[tuple[str, Any]], where first element of tuple is the arg type
-  # (or "constexpr" for constants), and the second parameter is the 'specialization'
-  # value which is an attribute designed to trigger a separately compiled kernel variant
-  # for that specific argument value (it let chose a specific compiled kernel that's
-  # best for argument value and its alignment; such as special cases for constexprs,
-  # ones, and values divisible by 16). Note that in certain cases, the specialization
-  # value might be a hash string (hopefully!!! lowercase), such as for callables.
+  # A specialization is a list[tuple[str, Any]], one entry per kernel parameter, that
+  # captures two things about each argument at call time:
+  #   1. Element 0 — the type string: e.g. "i32", "i64", "*fp16", "*ki32"
+  #     (pointer to const), "u1", "fp32", "constexpr", "tensordesc<...>".
+  #   2. Element 1 — the specialization value (the "key"): an attribute that may trigger
+  #     a separately compiled kernel variant. Currently possible values are:
+  #     - None — no runtime specialization (used for bools, floats, do_not_specialize
+  #         params)
+  #     - "D" — value/pointer is divisible by 16 (alignment hint)
+  #     - "" (empty string) — value/pointer is NOT divisible by 16
+  #     - The actual Python value itself — for constexpr parameters and integer-valued 1
+  #     - A cache_key — for JITCallable (nested kernel) arguments. Note that in that
+  #         case the specialization value is a hash string (hopefully!!! lowercase).
+  #         Likely by a coincidence this doesn't hurt to `attrs` building later!
+  # The specialization values are determined at call time by native_specialize_impl in
+  # C++ (triton/python/src/specialize.cc).
+  # Specialization serves 3 goals: (1) affect kernel caching key, (2) discover additional
+  # vars to be turned into constexprs by the compiler, (3) source for `attrs` spec.
   #
   # Their implementation handle params better, but we likely can't use their code since
   # they supply an argument value to specialize_impl() directly, while we can't do it
@@ -541,7 +547,7 @@ def get_or_create_triton_kernel(
   # arguments of the kernel! For constexprs compiler doesn't need this, as it has the
   # value itself.
   alignments = [16] * len(arg_dtypes)
-  for i, _, _ in scalar_args:
+  for i in scalar_args:
     alignments[i] = 0
   specialize_impl = _triton.native_specialize_impl
   is_const = False  # set as tl.const type hints and marks read-only data
@@ -567,6 +573,9 @@ def get_or_create_triton_kernel(
       # attr could be None if specialization is disabled, or when an arg value is None.
       # Attributes for these doesn't make sense, and the upstream uses a similar check.
   }
+  # attrs keys are tuples of integers representing a path into the (possibly nested)
+  # kernel argument list as it is seen by the Triton compiler (i.e. including all
+  # constexprs and whatnot, - everything as in the signature)
 
   constexpr_names = [p.name for p in fn.params if p.is_constexpr]
 
@@ -583,15 +592,57 @@ def get_or_create_triton_kernel(
   # args==1 are also treated as constexprs IFF specialization is enabled in
   # specialize.cc:L238. The rationale is that 1s are extremely common as strides or
   # sizes, so it's very beneficial to compile that as a special case
-  # TODO: a check if specialization is enabled is needed here for test for == 1! Better
-  # use Triton's specialization pipeline and infer constexprs from it instead, return
-  # scalar_args_blacklist indices back to a caller, so they won't be passed as kernel
-  # invocation arguments.
-  constexprs.update({fn.arg_names[i]: v for i, _, v in scalar_args if v == 1 or v is None})
+  constexprs.update({fn.arg_names[i]: v for i, v in scalar_args.items() if v == 1 or v is None})
 
   # adding constexprs info to the signature
   for constant in constexprs:
     signature[constant] = "constexpr"
+
+  # TODO here's what we need eventually to properly cache, compile and launch a kernel:
+  # - kernel func signature dict {kernel param name -> data type} built from a rt made
+  #     specialization
+  # - `attrs` dict built from a runtime made specialization list
+  # - constexprs dict {kernel param name -> constexpr value}, built from explicit
+  #     metaparams, default values, and a runtime made specialization list
+  # - backend options dict, built exclusively from metaparams passed
+  # - renewed args + args_dtypes lists (having specialized constexprs removed and
+  #     defaults added).
+  # 
+  # Intermediates:
+  # - runtime made specialization list.
+
+  # NOTE: To properly add defaults to rt-scalars requires:
+  # - adding a default value to output arg too. We could have a convention to set it to
+  #   None and verify that in the binder generating method during signature inspection.
+  # - args and args_dtypes lists in extract_avals() can no longer be built from
+  #   positional args (ctx.avals..) directly, but must be built from inspecting the
+  #   signature and explicitly matching `strictly_out_avals` to the last
+  #   `len(strictly_out_avals)` parameters backwards from the first constexpr argument.
+  # - we must call generated binder function strictly using key-value arg notation to
+  #   allow for correct argument matching.
+  # - the generated binder function must check that none of outputs must have a value of
+  #   None
+  # Triton gets away with that by not requiring the outputs go last in the list of rt
+  # arguments, so absent rt args get their defaults naturally (similarly no issues
+  # to build named_args=dict(zip(self.arg_names, args)) in the autotuner - it just lacks
+  # rt args with defaults to be set later). We (at this moment) must
+  # specify outputs and they are always after in and in/out args, so to let the binder
+  # match param names, we must call it using key-value representation of args...
+
+  # TODO: generated binder function. Care for output arguments, JAX tracers and scalars.
+  #  We need from it:
+  
+  #
+  # TODO: extract constexprs from rt-args specialization too
+  # 
+  # TODO: return which args must be skipped from sending to the kernel due to turning
+  # into constexprs.
+
+  # TODO: 2 phase cache key resolution and store all that in the `fn` object itself.
+  # Cache must include everything affecting
+  # compilation, i.e.: specializations for runtime args, list of constexprs, backend
+  # options, compute capability... what else?
+  # Param datatypes/signature is already in specialization and constexprs
 
   # Cache key should contain any parameter that can affect the compiler output.
   cache_key = (
@@ -702,7 +753,7 @@ def get_or_create_triton_kernel(
 
 def make_autotuner_configs(
   fn: autotuner.Autotuner,
-  scalar_args: tuple[tuple[int, str, Any], ...],
+  scalar_args: dict[int, Any],
   metaparams: dict[str, Any],
   named_args: dict[str, Any],
 ) -> list[triton.Config]:
@@ -723,7 +774,7 @@ def make_autotuner_configs(
   assert isinstance(fn, autotuner.Autotuner)
 
   key_idxs = [fn.arg_names.index(k) for k in fn.keys]
-  if any(idx not in key_idxs for idx, _, _ in scalar_args):
+  if any(idx not in key_idxs for idx in scalar_args):
     logging.warning(
         "Auto-tuning key does not include all scalar arguments. "
         "We may perform redundant auto-tuning."
@@ -777,28 +828,109 @@ def make_configs_from_heuristics(
   return updated_configs
 
 
-def extract_avals(
-  ctx,
-  scalar_args: tuple[tuple[int, str, Any], ...],
-  input_output_aliases: dict[int, int],
-) -> tuple[list[Any], list[str]]:
-  """ Extract all arguments' abstract values and their Triton types from the context."""
-  args = list(ctx.avals_in)
-  arg_dtypes = list(map(get_triton_type, ctx.avals_in))
-  for idx, dtype, v in scalar_args:
-    args.insert(idx, v)
-    arg_dtypes.insert(idx, dtype)
+class JTJITFunction:
+  """A wrapper around Triton's JITFunction/GluonJITFunction object to isolate the rest
+  of the code from Triton's internals and provide a unified interface to bits needed.
 
-  # Extract only the output avals not referenced in the input_output_aliases mapping.
-  strictly_out_avals = [
-    aval
-    for i, aval in enumerate(ctx.avals_out)
-    if i not in input_output_aliases.values()
-  ]
-  args.extend(strictly_out_avals)
-  arg_dtypes.extend(map(get_triton_type, strictly_out_avals))
+  Additionally, it provides a persistence layer to ensure that a certain data doesn't
+  have to be re-created on each kernel launch. A user may assume that even when they
+  create a new JTJITFunction object for an object previously used JITFunction object,
+  the persistent data is reused.
 
-  return args, arg_dtypes
+  Since we don't instantiate JTJITFunction objects the way JITFunction objects are
+  instantiated and JTJITFunction have a short lifes, we have to store the data in the
+  very JITFunction object itself. Once we implement a custom decorator similar to
+  triton.jit() to have a JTJITFunction with a proper lifetime, this will be fixed.
+  """
+
+  def __init__(
+    self,
+    fn: autotuner.Heuristics
+    | autotuner.Autotuner
+    | triton.JITFunction
+    | gl_runtime.GluonJITFunction,
+  ):
+    # peel off wrappers to get to the JITFunction object
+    self.has_autotuner = isinstance(fn, autotuner.Autotuner)
+    if self.has_autotuner:
+      fn = fn.fn
+    self.has_heuristics = isinstance(fn, autotuner.Heuristics)
+    if self.has_heuristics:
+      fn = fn.fn
+
+    if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
+      raise ValueError(
+          "`kernel` must be a Triton's `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner` object."
+      )
+    self.fn = fn
+
+  @cached_property
+  def arg_names(self) -> list[str]:
+    # .arg_names as per comment is deprecated
+    return (
+      self.fn.arg_names
+      if hasattr(self.fn, "arg_names")
+      else [p.name for p in self.fn.params]
+    )
+
+
+class KernelArgs:
+  """Info on all non-constexpr arguments used to launch a kernel in one place.
+
+  Note the semantic: function parameters are what are written in the function signature,
+  while arguments are what is passed to function on its invocation.
+
+  Each object has the following attributes:
+  - scalars: dict[int, Any] - maps positional scalar args indices to values
+  - input_output_aliases: dict[int, int] - maps input ordinal numbers to output ordinal numbers
+  - args: list[Any] - list of all arguments (in, in-out, out), including scalars,
+      in the order they are passed to the kernel.
+  - arg_dtypes: list[str] - list of all arguments' Triton types in the order they are passed to the kernel
+  - n_outputs: int - number of output arguments
+
+  By construction, all arguments that aren't scalar_args have JAX abstract values.
+
+  scalars, args and arg_dtypes might be updated during processing to add missing
+  arguments with default values and to remove arguments that the compiler turns into
+  constexprs.
+  """
+
+  def __init__(self, ctx, scalar_args: dict[int, Any], input_output_aliases: dict[int, int]):
+    args, arg_dtypes = self._extract_avals(ctx, scalar_args, input_output_aliases)
+
+    self.args = args
+    self.arg_dtypes = arg_dtypes
+    self.scalars = scalar_args
+    self.input_output_aliases = input_output_aliases
+    self.n_outputs = len(ctx.avals_out)
+
+    # TODO: to properly provide defaults, we need a param_name->(value,dtype) mapping
+
+  @staticmethod
+  def _extract_avals(
+    ctx,
+    scalar_args: dict[int, Any],
+    input_output_aliases: dict[int, int],
+  ) -> tuple[list[Any], list[str]]:
+    """ Extract all (input, scalar & output) arguments' abstract values and their Triton
+    types from the context."""
+    args = list(ctx.avals_in)
+    arg_dtypes = list(map(get_triton_type, ctx.avals_in))
+    for idx, v in scalar_args.items():
+      args.insert(idx, v)
+      arg_dtypes.insert(idx, "constexpr" if v is None else get_triton_type(v))
+
+    # Extract only the output avals not referenced in the input_output_aliases mapping.
+    strictly_out_avals = [
+      aval
+      for i, aval in enumerate(ctx.avals_out)
+      if i not in input_output_aliases.values()
+    ]
+    args.extend(strictly_out_avals)
+    arg_dtypes.extend(map(get_triton_type, strictly_out_avals))
+
+    return args, arg_dtypes
+
 
 
 def make_kernel_params(
@@ -838,13 +970,18 @@ def make_kernel_params(
     )
 
     # zeroed_params_with_sizes is a dict output_arg_idx -> aval_size_bytes
-    # config_zeroed_outputs is output ordinal numbers
+    # config_zeroed_outputs is a list of ordinal numbers of output arguments
     zeroed_params_with_sizes = {
       output2input[i] if i in output2input else i + outputs_offset: aval_size_bytes(
         ctx.avals_out[i]
       )
       for i in sorted(config_zeroed_outputs)
     }
+    # TODO turning zeroed_params_with_sizes keys to _array_ indices only (i.e.
+    # rely only on ctx.avals_in) will help get rid of dependency on scalars number
+    # completely. But this requires "subtracting" relevant scalar numbers from
+    # output2input values too (doable as we know all of that). Then we'd need to modify
+    # `triton_kernel_call_lib.create_array_parameter()` call below.
 
     kernel_params.append(
       dict(
@@ -862,18 +999,19 @@ def make_kernel_params(
 def triton_kernel_call_lowering(
     make_gpu_target_func,
     ctx,
-    *array_args,
+    *abstract_args,
     fn,
-    scalar_args,
+    concrete_args_tuple,
     kernel_call_name,
     custom_call_target_name,
-    out_shapes,
+    # out_shapes,
     grid,
     compute_capability,
     input_output_aliases,
     zeroed_outputs,
     serialized_metadata,
-    metaparams: tuple[tuple[str, Any], ...],
+    args_kwargs,
+    # metaparams: tuple[tuple[str, Any], ...],
 ):
   # we have to pass metaparams dictionary as a tuple to allow hashing necessary for
   # lowering via xla_primitive_callable()
@@ -882,13 +1020,17 @@ def triton_kernel_call_lowering(
   assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
   input_output_aliases = dict[int,int](input_output_aliases)
 
+  assert isinstance(concrete_args_tuple, tuple), "concrete_args_tuple must be a tuple"
+  scalar_args = dict[int, Any](concrete_args_tuple)
+
   # if it fires, it's a programmer's mistake and no exception handling could fix that.
   # This is basically to validate the fields were set earlier in triton_call()
   assert all(
     isinstance(metaparams[k], int) for k in ("num_warps", "num_stages", "num_ctas")
   ), "num_warps, num_stages, and num_ctas must be integers"
 
-  args, arg_dtypes = extract_avals(ctx, scalar_args, input_output_aliases)
+  # TODO
+  args, arg_dtypes = KernelArgs._extract_avals(ctx, scalar_args, input_output_aliases)
   # args here mean only positional i.e. non-constexpr args, including scalars.
 
   if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
@@ -903,6 +1045,8 @@ def triton_kernel_call_lowering(
     # This is fully coherent with how upstream does it in Autotuner/Heuristics classes.
     # These are genuinely name-value pairs for passed positional arguments only, and not
     # `bound_args` constructed using kernel's signature.
+
+    # TODO: consequences of adding defaults to RT args here?
 
   if isinstance(fn, autotuner.Autotuner):
     # We should unpack autotuner first and heuristics second to ensure we'd
@@ -961,7 +1105,7 @@ def triton_kernel_call_lowering(
 
     # TODO how does it handle positional scalars in random positions?
 
-    equal_to_1_or_None = {i for i, _, v in scalar_args if v == 1 or v is None}
+    equal_to_1_or_None = {i for i, v in scalar_args.items() if v == 1 or v is None}
     for i, (arg, dtype) in enumerate(zip(args, arg_dtypes)):
       if isinstance(arg, core.ShapedArray):
         arg_attrs = specialization_attr[(i,)]
@@ -978,7 +1122,8 @@ def triton_kernel_call_lowering(
           arg = bool(arg)
         elif isinstance(arg, int):
           arg = int(arg)
-        elif isinstance(arg, float):
+        elif isinstance(arg, (float, np.float32, np.float64)):  # np dtypes are added
+          # to handle possible default values properly too
           arg = float(arg)
         call_params.append(
             triton_kernel_call_lib.create_scalar_parameter(arg, dtype)
@@ -995,8 +1140,10 @@ def triton_kernel_call_lowering(
     )
 
   if len(kernel_calls) > 1:
-    # TODO: test how this handles scalar_args with 1s and None-s
-    named_scalar_args = {fn.arg_names[i]: v for i, _, v in scalar_args}
+    # named_scalar_args seems to be only used for naming of the autotune call, which is
+    # used only for logging, so it's not important how it handles scalar_args with 1s
+    # and None-s, but still might just need a better name
+    named_scalar_args = {fn.arg_names[i]: v for i, v in scalar_args.items()}
     input_output_aliases_with_sizes = tuple(
         (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
         for input_idx, output_idx in input_output_aliases.items()
@@ -1016,7 +1163,8 @@ def triton_kernel_call_lowering(
       backend_config=zlib.compress(call_proto),
       operand_output_aliases=input_output_aliases,
   )
-  return rule(ctx, *array_args)
+  # Note if needed,array_args could be permuted before passing to the rule() 
+  return rule(ctx, *abstract_args)
 
 
 mlir.register_lowering(
@@ -1093,30 +1241,166 @@ def from_hashable_metaparams(astuple: tuple[tuple[str, Any], ...]) -> dict[str, 
   return metaparams
 
 
-def triton_call(
-    *args: jax.Array | bool | int | float | np.float32,
-    kernel: (
-        triton.JITFunction
-        | gl_runtime.GluonJITFunction
-        | triton.runtime.Heuristics
-        | triton.runtime.Autotuner
+def serialize_args_kwargs(fn, args: list, kwargs: dict):
+  """Prepares args and kwargs for passing through JAX's primitive system by separating
+  things that must be traced from things that must be passed as is.
+
+  Returns two sequences of traced values and a tuple of hashable reconstruction info.
+  Assumes that a caller adheres to the Triton's rules about argument types, so no
+  special checks for hashability are done for performance reasons.
+
+  Note that the function consumes kwargs, i.e. its state is modified in place.
+  """
+  # JAX's Primitive.bind(*args, **params) has a strict dichotomy:
+  # - *args (positional) are dynamic operands — values that participate in JAX's
+  # tracing/transformation system (jit, grad, vmap). During JIT compilation, they become
+  # abstract values (ShapedArray) and then MLIR SSA values in the lowered IR.
+  # - **params (keyword) are static parameters — they must be hashable, are passed
+  # through verbatim, and retain their concrete Python values across the entire
+  # compilation pipeline.
+  # Hence to pass data through JAX's primitive system we must separate things that must
+  # be traced from things that must be passed as is. The restriction is that since JAX
+  # arrays must be managed by XLA, they must be passed as traced items. The rest could
+  # go concrete helping to specialize the kernel properly.
+  # We must implement the separation in a way that (1) allows to reconstruct both `args`
+  # and `kwargs` back exactly on the other end to process them properly, and (2) all JAX
+  # array arguments go into .bind() call in exactly the same order as the kernel expects
+  # them (so we don't have to reshuffle them later during the lowering). In that we
+  # assume that no JAX array could be specialized to a constexpr for compiling, which
+  # holds in the upstream Triton too (small arrays could be passed as tuples/lists
+  # though to constexpr annotated params).
+
+  flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
+  # We must let Nones to pass through flattening and `is_leaf` semantic is additive.
+
+  # Since there's usually much more non-vector parameters than vectors, extracting
+  # vectors from flat_args. Jax explicitly guarantee that `isinstance(x, jnp.ndarray)`
+  # check behaves correctly for raw arrays as well as for tracers. For jitting all/most
+  # of Python scalars are mapped to ShapedArray avals too, so they are treated as arrays
+  # by the check. However, there's no use-case where we might want to pass a scalar as a
+  # traceable thing into the kernel call, so we can safely assume a user will mark it as
+  # a static argument for jitting (the old implementation relied on that too).
+  abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
+  static_args = (v for v in flat_args if not isinstance(v, jax.Array))
+  # we're going to pass flat_args as static params now. There's a caveat at least for
+  # tl.constexpr() objects: JAX's lowering code seems to require only hashability
+  # and correct equality semantics for static objects, and this is true for
+  # tl.constexpr() with a nuance: on comparison it returns not a bool True/False, but
+  # another tl.constexpr() object with a bool value. So if there's a silly check in JAX
+  # that the `(a==b) is True`, or `type(a==b) is bool` - it'll break.
+
+  # Now do the same for kwargs with a caveat - we must traverse them in order of kernel
+  # parameters declaration to ensure arrays ends up in a correct order
+  def contain_arrays(v):
+    if isinstance(v, jax.Array):
+      return True
+    elif isinstance(v, tuple):  # among pytrees only tuples could be passed as arguments
+      return any(contain_arrays(x) for x in v)
+    return False
+
+  class _FakeVal: ...
+
+  abs_kwargs_list = []  # only values to abstract
+  abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
+  for aname in JTJITFunction(fn).arg_names:
+    # if kwargs has that parameter AND the value contains an array somewhere (including
+    # nested tuples/lists), we handle the whole arg value differently to be able to
+    # reconstruct it correctly. Otherwise we just skip the arg to pass it along with
+    # other kwargs, such as backend options.
+    arg_val = kwargs.get(aname, _FakeVal())
+    if contain_arrays(arg_val):
+      del kwargs[aname]  # handle the value differently
+      if isinstance(arg_val, jax.Array):  # shortcutting if the value is a raw array
+        abs_kwargs_list.append(arg_val)
+        abs_kwargs_meta[aname] = None
+      else:  # do full flattening
+        flat_v, the_tree = tree_util.tree_flatten(arg_val)
+        abs_v = {i: v for i, v in enumerate(flat_v) if isinstance(v, jax.Array)}
+        static_v = tuple(v for v in flat_v if not isinstance(v, jax.Array))
+        abs_kwargs_list.extend(abs_v.values())
+        abs_kwargs_meta[aname] = (static_v, tuple(abs_v.keys()), the_tree)
+
+  return (
+    abs_args.values(),  # intentionally not materialized
+    abs_kwargs_list,
+    (  # first args info
+      args_tree,
+      tuple(abs_args.keys()),
+      tuple(static_args),
+      # kwargs info
+      tuple(abs_kwargs_meta.items()),
+      to_hashable_metaparams(kwargs),
     ),
-    out_shape: ShapeDtype | Sequence[ShapeDtype],
-    grid: GridOrLambda,
-    name: str = "",
-    custom_call_target_name: str = "triton_kernel_call",
-    num_warps: int | None = None,
-    num_stages: int | None = None,
-    num_ctas: int = 1,  # TODO(giorgioa): Add support for dimensions tuple.
-    compute_capability: int | None = None,
-    enable_fp_fusion: bool = True,
-    input_output_aliases: dict[int, int] | None = None,
-    zeroed_outputs: (
-        Sequence[int] | Callable[[dict[str, Any]], Sequence[int]]
-    ) = (),
-    debug: bool = False,
-    serialized_metadata: bytes = b"",
-    **metaparams: Any,
+  )
+
+
+def deserialize_args_kwargs(
+  ctx, abstract_args: list, args_kwargs_meta: tuple
+) -> tuple[list, dict]:
+  """Reconstructs args and kwargs from the serialized form. Abstract arguments are
+  replaced by stubs."""
+  args_tree, abs_args_keys, static_args, abs_kwargs_meta, kwargs = args_kwargs_meta
+  abs_kwargs_meta = dict[str, None | tuple[tuple, tuple, Any]](abs_kwargs_meta)
+  # abstract_args is a concatenation of abs_args.values() and abs_kwargs_list, but 
+  # abs_kwargs_meta has a more complex inner structure and its length could be smaller
+  # than a corresponding portion of abstract_args storing abs_kwargs_list.
+
+  default_alignment = 16
+  def make_stub(i: int):
+    arg_dtype = get_triton_type(ctx.avals_in[i])
+    return types.SimpleNamespace(
+      data_ptr=lambda: default_alignment, dtype=arg_dtype.removeprefix("*")
+    )
+
+  args = list(static_args)
+  kwargs_ofs = len(abs_args_keys)
+  abs_v = [make_stub(i) for i in range(kwargs_ofs)]
+  for i,v in unsafe_zip(abs_args_keys, abs_v):
+    args.insert(i, v)
+  args = tree_util.tree_unflatten(args_tree, args)
+
+  kwargs = from_hashable_metaparams(kwargs)
+  for aname, meta in abs_kwargs_meta.items():
+    assert aname not in kwargs
+    if meta is None:
+      kwargs[aname] = make_stub(kwargs_ofs)
+      kwargs_ofs += 1
+    else:
+      static_v, abs_v_keys, the_tree = meta
+      n_keys = len(abs_v_keys)
+      abs_v = [make_stub(kwargs_ofs + j) for j in range(n_keys)]
+      kwargs_ofs += n_keys
+      static_v = list(static_v)
+      for k,v in unsafe_zip(abs_v_keys, abs_v):  # assume sorted keys
+        static_v.insert(k, v)
+      kwargs[aname] = tree_util.tree_unflatten(the_tree, static_v)
+  assert kwargs_ofs == len(abstract_args)
+
+  return args, kwargs
+
+
+def triton_call(
+  *args: jax.Array | bool | int | float | np.float32,
+  kernel: (
+    triton.JITFunction
+    | gl_runtime.GluonJITFunction
+    | triton.runtime.Heuristics
+    | triton.runtime.Autotuner
+  ),
+  out_shape: ShapeDtype | Sequence[ShapeDtype],
+  grid: GridOrLambda,
+  name: str = "",
+  custom_call_target_name: str = "triton_kernel_call",
+  num_warps: int | None = None,
+  num_stages: int | None = None,
+  num_ctas: int = 1,  # TODO(giorgioa): Add support for dimensions tuple.
+  compute_capability: int | None = None,
+  enable_fp_fusion: bool = True,
+  input_output_aliases: dict[int, int] | None = None,
+  zeroed_outputs: (Sequence[int] | Callable[[dict[str, Any]], Sequence[int]]) = (),
+  debug: bool = False,
+  serialized_metadata: bytes = b"",
+  **kwargs: Any,
 ) -> Any:
   """Calls a Triton kernel with `jax.Array` arguments.
 
@@ -1170,7 +1454,13 @@ def triton_call(
   ```
 
   Args:
-    *args: Inputs for the Triton kernel.
+    *args: Positional inputs for the Triton kernel. All input arrays must be passed as
+      positional arguments in the order they are declared in the kernel signature,
+      except for purely output arguments that are allocated and passed to the kernel
+      implicitly (user do not need to pass them explicitly). In the kernel signature,
+      purely output parameters should be anywhere after the last input array parameter.
+      Scalar values can be passed as positional arguments in this sequence, or as
+      key-value arguments.
     kernel: A Triton kernel (e.g. a function decorated with `triton.jit`). All
       static values should be annotated with `triton.language.constexpr` or
       `triton.experimental.gluon.language.constexpr`.
@@ -1182,108 +1472,72 @@ def triton_call(
       tuple of up to 3 integers. When `grid` is an integer, `kernel` is
       invocated in `grid`-many parallel executions. When `grid` is a sequence of
       integers, `kernel` is launched in a `prod(grid)`-many parallel execution.
-      When `grid` is a function, it is passed `**metaparams` and should return a
+      When `grid` is a function, it is passed `**kwargs` and should return a
       tuple of up to 3 integers.
-    input_output_aliases: A dictionary mapping input argument indices to output
-      indices. Providing a mapping will alias the corresponding buffers.
-    zeroed_outputs: A sequence of indices, or a function returning a sequence of
-      indices, for outputs that should be zeroed before the kernel is launched.
-      Note that this also supports zeroing input-output (i.e. aliased through
-      `input_output_aliases`) arguments that should be treated as outputs in this
-      argument.
+    input_output_aliases: A dictionary mapping input argument indices in `args`
+      to output argument indices, to alias the corresponding buffers.
+    zeroed_outputs: A sequence of output indices, or a function returning a sequence of
+      such indices, for outputs that should be zeroed before the kernel is launched.
+      This argument also supports zeroing input-output (i.e. aliased through
+      `input_output_aliases`) arguments.
     num_warps: The number of warps used to execute the Triton kernel.
     num_stages: The number of stages emitted by the Triton compiler.
     num_ctas: The size of thread blocks per cluster to be used on GPUs with
       compute capabilities >= 9.0. It must be less or equal to 8.
-    debug: Prints out intermediate IRs if True for debugging purposes.
+    enable_fp_fusion: Whether to enable floating-point operands fusion for the kernel.
+    debug: Prints out intermediate IRs if True for debugging purposes. Also used as a
+      the backend options argument.
     serialized_metadata: Arbitrary metadata that will be added into the
       serialized kernel call.
-    metaparams: A dictionary of arguments that will be provided to a `grid`
-      (if it is a function) and to the Triton kernel as `constexpr` arguments.
+    kwargs: Key-value pairs (num_warps, num_stages, num_ctas, debug and enable_fp_fusion
+      arguments are added there automatically) that will be provided to:
+      - a `grid` (if it is a function),
+      - backend options constructor (only recognized arguments are passed),
+      - the Triton kernel as `constexpr` arguments (constexprs must always be scalars)
+        or regular runtime arguments (scalars only; arrays must be passed as positional
+        arguments) (only recognized as kernel parameters are passed).
+
+    Default values in kernel signature are supported only for scalars, or for output
+    arguments (for outputs only the value of None is allowed as a default - this is
+    useful when a scalar with a default value needs to precede an output argument).
 
   Returns:
     Outputs from the Triton kernel.
   """
-  if not CAN_USE_TRITON:
-    raise ValueError(
-        "`triton_call` is only available when `triton` is installed."
-    )
-  out_shape = tree_util.tree_map(
-      lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
-  )
-  
-  # flat_args, _ = tree_util.tree_flatten(args)
-  flat_args = args
-  # TODO discuss this on the PR review.
-  # The are 2 problems with tree_util.tree_flatten(args):
-  # First is that is swallows None which is
-  # a perfectly legitimate value to pass to a kernel. This seems to be solvable (not
-  # sure though, 100% correctly) by adding `is_leaf=lambda x: x is None` argument to the
-  # call. Another (IMHO better) option is to use a special implementation that
-  # explicitly allows None's, such as `none_leaf_registry.flatten(args)` taken from
-  # `from jax._src.tree_util import none_leaf_registry`, but that relies on unstable
-  # internals, which is fragile.
-  #
-  # But there's a bigger and more important second problem - flattening args changes
-  # the semantic of kernel arguments: if a user uses, say a tuple of values as a kernel
-  # argument, their intent doesn't look like they want to have it to supply values for
-  # several kernel parameters. It looks like an intent to pass the tuple as a value of
-  # one single parameter, which is consistent with how Python works. But consider this:
-  # `jax.tree_util.tree_flatten((1,2,(5,6)))` yields a flat `[1, 2, 5, 6]`, so what
-  # initially were 3 values for 3 kernel parameters, now 4 values for 4 kernel
-  # parameters. This doesn't look like what the user intended to achieve at all.
-  # Triton explicitly allows to pass tuples as kernel args value, so this is definitely
-  # a compatibility bug.
-  # Hence, I think the best solution is to just leave it as is for now and fix tuple
-  # lowering later.
-
-  # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
-  flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
-
-  array_args = []
-  scalar_args = []  # these are *positional* scalar args
-  # TODO(Arech) b4 the PR, is it better to transform it to a "struct of arrays" form?
-  for i, arg in enumerate(flat_args):
-    if arg is None: # None's are turned into constexprs
-      scalar_args.append((i, "constexpr", None))
-    elif isinstance(arg, (bool, int, float)):
-      scalar_args.append((i, get_triton_type(arg), arg))
-    elif isinstance(arg, (np.float32, np.float64)):
-      scalar_args.append((i, get_triton_type(arg), float(arg)))
-    else:
-      # TODO(Arech) we need and could have lowering of tuples/lists similarly to how
-      # Triton does this (lists are silently converted to tuples) and this should work
-      # well with our launcher backend if done carefully, but this is a large and
-      # complex change, so postponing it to the next PR.
-      assert not isinstance(arg, (tuple, list, dict)), (
-        "triton_call does not support pytrees"
-      )
-      array_args.append(arg)
-
   if input_output_aliases is None:
     input_output_aliases = {}
+
+  # TODO support for outputs naming
+  out_shape = tree_util.tree_map(
+    lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
+  )
+  # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
+  flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
 
   # Python guarantees the keys don't exist. The original Triton has a single namespace
   # for both constexprs and backend options, and we're doing the same to unify processing
   # We are setting defaults here early, since we use values early
-  metaparams["num_warps"] = num_warps if num_warps is not None else 4
-  metaparams["num_stages"] = num_stages if num_stages is not None else 3
-  metaparams["num_ctas"] = num_ctas
-  metaparams["enable_fp_fusion"] = enable_fp_fusion
-  metaparams["debug"] = debug
+  kwargs["num_warps"] = num_warps if num_warps is not None else 4
+  kwargs["num_stages"] = num_stages if num_stages is not None else 3
+  kwargs["num_ctas"] = num_ctas
+  kwargs["enable_fp_fusion"] = enable_fp_fusion
+  kwargs["debug"] = debug
+
+  abs_args, abs_kwargs, args_kwargs_meta = serialize_args_kwargs(kernel, args, kwargs)
 
   out_flat = triton_kernel_call_p.bind(
-      *array_args,
-      fn=kernel,
-      scalar_args=tuple(scalar_args),
-      kernel_call_name=name,
-      custom_call_target_name=custom_call_target_name,
-      out_shapes=tuple(flat_out_shapes),
-      grid=grid,
-      compute_capability=compute_capability,
-      input_output_aliases=tuple(input_output_aliases.items()),
-      zeroed_outputs=zeroed_outputs,
-      serialized_metadata=serialized_metadata,
-      metaparams=to_hashable_metaparams(metaparams),
+    *abs_args,
+    *abs_kwargs,
+    fn=kernel,
+    kernel_call_name=name,
+    custom_call_target_name=custom_call_target_name,
+    # out_shapes=tuple(flat_out_shapes),
+    grid=grid,
+    compute_capability=compute_capability,
+    input_output_aliases=tuple(input_output_aliases.items()),
+    zeroed_outputs=zeroed_outputs,
+    serialized_metadata=serialized_metadata,
+    # metaparams=to_hashable_metaparams(kwargs),
+    args_kwargs=args_kwargs_meta,
   )
   return tree_util.tree_unflatten(out_tree, out_flat)

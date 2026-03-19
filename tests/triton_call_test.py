@@ -17,11 +17,13 @@ from unittest import mock
 
 from absl.testing import absltest
 from absl.testing import parameterized
+from copy import deepcopy
 import jax
 from jax import config
 from jax import random
 import jax.numpy as jnp
 import jax_triton as jt
+import jax_triton.triton_lib as jttl
 import numpy as np
 import triton
 import triton.language as tl
@@ -35,6 +37,99 @@ def setUpModule():
 
 def tearDownModule():
   config.update("jax_enable_x64", False)
+
+
+class ArgsKwargsTest(parameterized.TestCase):
+  def test_smoke(self):
+    @triton.jit
+    def kernel(int_, fl, a1, t1, st, t2, t3, t4, a, b, c, d, e, f, g, h):
+      pass
+
+    args = [
+      1,
+      3.14,
+      jnp.array([1, 2, 3], dtype=jnp.int8),
+      (3, 4),
+      "string",
+      (jnp.array([5, 6], dtype=jnp.int16),),
+      (9, jnp.array([7, 8], dtype=jnp.int32),jnp.array([70, 80], dtype=jnp.float32)),
+      (10, (jnp.array([7, 8], dtype=jnp.int64), 11)),
+    ]
+    kwargs = {
+      "b": 3.14,
+      "g": (9, jnp.array([7, 8], dtype=jnp.uint32),jnp.array([70, 80], dtype=jnp.float16)),
+      "h": (10, (jnp.array([7, 8], dtype=jnp.uint64), 11)),
+      "a": 1,
+      "e": "string",
+      "c": jnp.array([1, 2, 3], dtype=jnp.uint8),
+      "d": (3, 4),
+      "f": (jnp.array([5, 6], dtype=jnp.uint16),),
+    }
+    abs_args, abs_kwargs, args_kwargs_meta = jttl.serialize_args_kwargs(
+      kernel, args, deepcopy(kwargs)
+    )
+    
+    class FakeAvals:
+      @staticmethod
+      def _traverse(a, i, cnt):
+        if isinstance(a, jax.Array):
+          cnt += 1
+          if i == cnt:
+            return cnt, a
+        elif isinstance(a, tuple):
+          for b in a:
+            if isinstance(b, jax.Array):
+              cnt += 1
+              if i == cnt:
+                return cnt, b
+            elif isinstance(b, tuple):
+              for c in b:
+                if isinstance(c, jax.Array):
+                  cnt += 1
+                  if i == cnt:
+                    return cnt, c
+        return cnt, None
+
+      def __getitem__(self, i):
+        cnt = -1
+        for a in args:
+          cnt, v = self._traverse(a, i, cnt)
+          if v is not None:
+            return jax.core.ShapedArray(v.shape, v.dtype)
+
+        for k in sorted(kwargs.keys()):
+          cnt, v = self._traverse(kwargs[k], i, cnt)
+          if v is not None:
+            return jax.core.ShapedArray(v.shape, v.dtype)
+        assert False, f"Index {i} out of range"
+
+    ctx = jttl.types.SimpleNamespace(avals_in=FakeAvals())
+
+    dargs, dkwargs = jttl.deserialize_args_kwargs(
+      ctx, [*abs_args, *abs_kwargs], args_kwargs_meta
+    )
+
+    def assert_correct(a,b):
+      if isinstance(a, jax.Array):
+        # assert isinstance(b, jttl.types.SimpleNamespace)
+        assert jttl.get_triton_type(a).removeprefix("*") == b.dtype.removeprefix("*")
+      elif isinstance(a, tuple):
+        assert isinstance(b, tuple)
+        assert len(a) == len(b)
+        for ai, bi in zip(a, b):
+          assert_correct(ai, bi)
+      else:
+        assert isinstance(a, type(b))
+        assert a == b
+
+    assert len(args) == len(dargs)
+    assert len(kwargs) == len(dkwargs)
+    for ai in range(len(args)):
+      assert_correct(args[ai], dargs[ai])
+    for k in sorted(kwargs.keys()):
+      assert_correct(kwargs[k], dkwargs[k])
+
+
 
 
 @triton.jit
