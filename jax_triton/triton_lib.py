@@ -106,11 +106,17 @@ def avals_to_layouts(avals):
 
 
 def get_triton_type(obj: Any) -> str:
-  # if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
-  if hasattr(obj, "dtype"):
-    return f"*{_JAX_TO_TRITON_TYPE_MAP[obj.dtype]}"
+  if obj is None or isinstance(obj, str):
+    return "constexpr"  # these are always constexprs
+
   if isinstance(obj, (tl.constexpr, gl.constexpr)):
     obj = obj.value
+
+  # if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
+  if hasattr(obj, "dtype"):
+    dtype = _JAX_TO_TRITON_TYPE_MAP[obj.dtype]
+    return f"*{dtype}" if hasattr(obj, "shape") else dtype
+
   if isinstance(obj, bool):  # True == isinstance(True, int) !!!
     return "B"
   if isinstance(obj, int):
@@ -128,16 +134,6 @@ def get_triton_type(obj: Any) -> str:
     # Triton proper unconditionally treat all floats as fp32, so we should too.
     # If one wants fp64, they should use it explicitly with np.float64.
     return "fp32"
-  
-  """if isinstance(obj, np.float32):
-    return "fp32"
-  if isinstance(obj, np.float64):
-    return "fp64"
-  if isinstance(obj, np.float16):
-    return "fp16"""
-
-  if isinstance(obj, str):
-    return "str"
   raise NotImplementedError(
       f"could not compute type name for {obj}: {type(obj)}"
   )
