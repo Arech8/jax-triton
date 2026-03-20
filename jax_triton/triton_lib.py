@@ -497,6 +497,162 @@ _BACKEND_OPTIONS_FIELD_NAMES = {
 }
 
 
+class JTJITFunction:
+  """A wrapper around Triton's JITFunction/GluonJITFunction object to isolate the rest
+  of the code from Triton's internals and provide a unified interface to bits needed.
+
+  Additionally, it provides a persistence layer to ensure that a certain data doesn't
+  have to be re-created on each kernel launch. A user may assume that even when they
+  create a new JTJITFunction object for an object previously used JITFunction object,
+  the persistent data is reused.
+
+  Since we don't instantiate JTJITFunction objects the way JITFunction objects are
+  instantiated and JTJITFunction have a short lives, we have to store the data in the
+  very JITFunction object itself. For this we use custom attributes on the JITFunction
+  object, prefixed with `_jT_`. The capsized letter `T` breaks conventions to reduce a
+  possibility of clashing with anything else. This is temporary fix - once we implement
+  a custom decorator similar to triton.jit() to spawn a JTJITFunction object with a
+  proper lifetime, this will be removed.
+  """
+
+  def __init__(
+    self,
+    fn: autotuner.Heuristics
+    | autotuner.Autotuner
+    | triton.JITFunction
+    | gl_runtime.GluonJITFunction,
+  ):
+    # peel off wrappers to get to the JITFunction object
+    self.has_autotuner = isinstance(fn, autotuner.Autotuner)
+    if self.has_autotuner:
+      fn = fn.fn
+    self.has_heuristics = isinstance(fn, autotuner.Heuristics)
+    if self.has_heuristics:
+      fn = fn.fn
+
+    if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
+      raise ValueError(
+        "`kernel` must be a Triton's `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner` object."
+      )
+    self.fn = fn
+
+  @cached_property
+  def arg_names(self) -> list[str]:
+    # JITFunction::arg_names is deprecated, as per comment
+    return (
+      self.fn.arg_names
+      if hasattr(self.fn, "arg_names")
+      else [p.name for p in self.fn.params]
+    )
+
+  @property  # it's needed only for compiling once, so it's better have this like that
+  def params(self) -> list[triton.runtime.jit.KernelParam]:
+    return self.fn.params
+
+  @property
+  def is_gluon(self) -> bool:
+    return isinstance(self.fn, gl_runtime.GluonJITFunction)
+
+  @property
+  def signature(self) -> inspect.Signature:
+    return self.fn.signature
+
+  def get_binder(
+    self, backend
+  ) -> Callable[
+    [Any, ..., Any], tuple[dict[str, Any], list[tuple[str, Any]], dict[str, Any]]
+  ]:
+    if not hasattr(self.fn, "_jT_binder"):
+      # In the upstream, a binder is per-device. Since JAX doesn't support mixed
+      # execution yet, we can safe ignore it.
+      self.fn._jT_binder = triton_runtime_jit.create_function_from_signature(
+        self.fn.signature, self.fn.params, backend
+      )
+    return self.fn._jT_binder
+
+  def get_cached_kernel(
+    self,
+    compute_capability: int,
+    specialization: list[tuple[str, Any]],
+    options: dict[str, Any],
+  ) -> tuple[str, triton_kernel_call_lib.TritonKernel | None]:
+    if "_cOmpute_capability" in options:  # capsizing is intended!
+      raise ValueError("'_cOmpute_capability' key is reserved in the options/kwargs!")
+    options["_cOmpute_capability"] = compute_capability
+
+    if not hasattr(self.fn, "_jT_kernel_cache_key"):
+      self.fn._jT_kernel_cache_key = {}
+
+    # two step key resolution is important for supporting callables
+    key = triton_runtime_jit.compute_cache_key(
+      self.fn._jT_kernel_cache_key, specialization, options
+    )
+    del options["_cOmpute_capability"]
+
+    if not hasattr(self.fn, "_jT_kernel_cache"):
+      self.fn._jT_kernel_cache = {}
+
+    return key, self.fn._jT_kernel_cache.get(key, None)
+
+  def add_cached_kernel(
+    self,
+    key: str,
+    kernel: triton_kernel_call_lib.TritonKernel,
+  ):
+    assert isinstance(self.fn._jT_kernel_cache, dict)
+    self.fn._jT_kernel_cache[key] = kernel
+
+  def try_get_specialized_kernel(
+    self, backend, compute_capability: int, args: list[Any], kwargs: dict[str, Any]
+  ) -> tuple[
+    str,  # key
+    triton_kernel_call_lib.TritonKernel | None,  # kernel
+    dict[str, Any],  # named_args
+    list[tuple[str, Any]],  # specialization
+    dict[str, Any],  # attrs
+    dict[str, Any],  # non_constexpr
+  ]:
+    named_args, specialization, other_kwargs = self.get_binder(backend)(*args, **kwargs)
+
+    # have to always make attributes, since we need them for launching the kernel
+    attrvals = [x[1] for x in specialization]
+    attrs = triton_runtime_jit.find_paths_if(attrvals, lambda _, x: isinstance(x, str))
+    attrs = {
+      k: backend.parse_attr(triton_runtime_jit.get_iterable_path(attrvals, k))
+      for k in attrs
+    }
+
+    key, kernel = self.get_cached_kernel(
+      compute_capability, specialization, other_kwargs
+    )
+
+    self._sigvals = [x[0] for x in specialization]
+    non_constexprs = triton_runtime_jit.find_paths_if(
+      self._sigvals, lambda _, val: val != "constexpr"
+    )
+    non_constexprs = {
+      path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
+      for path in non_constexprs
+    }
+
+    return key, kernel, named_args, specialization, attrs, non_constexprs
+
+  def make_signature_and_constexprs(
+    self, specialization: list[tuple[str, Any]], named_args: dict[str, Any]
+  ) -> tuple[dict[str, Any], dict[str, Any]]:
+    # signature
+    signature = dict(zip(self.arg_names, self._sigvals))
+    # constexprs
+    constexprs = triton_runtime_jit.find_paths_if(
+      self._sigvals, lambda _, val: val == "constexpr"
+    )
+    constexprs = {
+      path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
+      for path in constexprs
+    }
+    return signature, constexprs
+
+
 # TODO make this a method of JTJITFunction
 def get_or_create_triton_kernel(
   make_gpu_target_func,
@@ -847,190 +1003,6 @@ def make_configs_from_heuristics(
     updated_config.kwargs = kwargs
     updated_configs.append(updated_config)
   return updated_configs
-
-
-class JTJITFunction:
-  """A wrapper around Triton's JITFunction/GluonJITFunction object to isolate the rest
-  of the code from Triton's internals and provide a unified interface to bits needed.
-
-  Additionally, it provides a persistence layer to ensure that a certain data doesn't
-  have to be re-created on each kernel launch. A user may assume that even when they
-  create a new JTJITFunction object for an object previously used JITFunction object,
-  the persistent data is reused.
-
-  Since we don't instantiate JTJITFunction objects the way JITFunction objects are
-  instantiated and JTJITFunction have a short lives, we have to store the data in the
-  very JITFunction object itself. For this we use custom attributes on the JITFunction
-  object, prefixed with `_jT_`. The capsized letter `T` breaks conventions to reduce a
-  possibility of clashing with anything else. This is temporary fix - once we implement
-  a custom decorator similar to triton.jit() to spawn a JTJITFunction object with a
-  proper lifetime, this will be removed.
-  """
-
-  def __init__(
-    self,
-    fn: autotuner.Heuristics
-    | autotuner.Autotuner
-    | triton.JITFunction
-    | gl_runtime.GluonJITFunction,
-  ):
-    # peel off wrappers to get to the JITFunction object
-    self.has_autotuner = isinstance(fn, autotuner.Autotuner)
-    if self.has_autotuner:
-      fn = fn.fn
-    self.has_heuristics = isinstance(fn, autotuner.Heuristics)
-    if self.has_heuristics:
-      fn = fn.fn
-
-    if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
-      raise ValueError(
-        "`kernel` must be a Triton's `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner` object."
-      )
-    self.fn = fn
-
-  @cached_property
-  def arg_names(self) -> list[str]:
-    # JITFunction::arg_names is deprecated, as per comment
-    return (
-      self.fn.arg_names
-      if hasattr(self.fn, "arg_names")
-      else [p.name for p in self.fn.params]
-    )
-
-  @property  # it's needed only for compiling once, so it's better have this like that
-  def params(self) -> list[triton.runtime.jit.KernelParam]:
-    return self.fn.params
-
-  @property
-  def is_gluon(self) -> bool:
-    return isinstance(self.fn, gl_runtime.GluonJITFunction)
-
-  @property
-  def signature(self) -> inspect.Signature:
-    return self.fn.signature
-
-  def get_binder(
-    self, backend
-  ) -> Callable[
-    [Any, ..., Any], tuple[dict[str, Any], list[tuple[str, Any]], dict[str, Any]]
-  ]:
-    if not hasattr(self.fn, "_jT_binder"):
-      # In the upstream, a binder is per-device. Since JAX doesn't support mixed
-      # execution yet, we can safe ignore it.
-      self.fn._jT_binder = triton_runtime_jit.create_function_from_signature(
-        self.fn.signature, self.fn.params, backend
-      )
-    return self.fn._jT_binder
-
-  def get_cached_kernel(
-    self,
-    compute_capability: int,
-    specialization: list[tuple[str, Any]],
-    options: dict[str, Any],
-  ) -> tuple[str, triton_kernel_call_lib.TritonKernel | None]:
-    if "_cOmpute_capability" in options:  # capsizing is intended!
-      raise ValueError("'_cOmpute_capability' key is reserved in the options/kwargs!")
-    options["_cOmpute_capability"] = compute_capability
-
-    if not hasattr(self.fn, "_jT_kernel_cache_key"):
-      self.fn._jT_kernel_cache_key = {}
-
-    # two step key resolution is important for supporting callables
-    key = triton_runtime_jit.compute_cache_key(
-      self.fn._jT_kernel_cache_key, specialization, options
-    )
-    del options["_cOmpute_capability"]
-
-    if not hasattr(self.fn, "_jT_kernel_cache"):
-      self.fn._jT_kernel_cache = {}
-
-    return key, self.fn._jT_kernel_cache.get(key, None)
-
-  def add_cached_kernel(
-    self,
-    key: str,
-    kernel: triton_kernel_call_lib.TritonKernel,
-  ):
-    assert isinstance(self.fn._jT_kernel_cache, dict)
-    self.fn._jT_kernel_cache[key] = kernel
-
-  def try_get_specialized_kernel(
-    self, backend, compute_capability: int, args: list[Any], kwargs: dict[str, Any]
-  ) -> tuple[
-    str,  # key
-    triton_kernel_call_lib.TritonKernel | None,  # kernel
-    dict[str, Any],  # named_args
-    list[tuple[str, Any]],  # specialization
-    dict[str, Any],  # attrs
-    dict[str, Any],  # non_constexpr
-  ]:
-    named_args, specialization, other_kwargs = self.get_binder(backend)(*args, **kwargs)
-
-    # have to always make attributes, since we need them for launching the kernel
-    attrvals = [x[1] for x in specialization]
-    attrs = triton_runtime_jit.find_paths_if(attrvals, lambda _, x: isinstance(x, str))
-    attrs = {
-      k: backend.parse_attr(triton_runtime_jit.get_iterable_path(attrvals, k))
-      for k in attrs
-    }
-
-    key, kernel = self.get_cached_kernel(
-      compute_capability, specialization, other_kwargs
-    )
-
-    self._sigvals = [x[0] for x in specialization]
-    non_constexprs = triton_runtime_jit.find_paths_if(
-      self._sigvals, lambda _, val: val != "constexpr"
-    )
-    non_constexprs = {
-      path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
-      for path in non_constexprs
-    }
-
-    return key, kernel, named_args, specialization, attrs, non_constexprs
-
-  def make_signature_and_constexprs(
-    self, specialization: list[tuple[str, Any]], named_args: dict[str, Any]
-  ) -> tuple[dict[str, Any], dict[str, Any]]:
-    # signature
-    signature = dict(zip(self.arg_names, self._sigvals))
-    # constexprs
-    constexprs = triton_runtime_jit.find_paths_if(
-      self._sigvals, lambda _, val: val == "constexpr"
-    )
-    constexprs = {
-      path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
-      for path in constexprs
-    }
-    return signature, constexprs
-
-  """
-  @staticmethod
-  def _extract_avals(
-    ctx,
-    scalar_args: dict[int, Any],
-    input_output_aliases: dict[int, int],
-  ) -> tuple[list[Any], list[str]]:
-    "" " Extract all (input, scalar & output) arguments' abstract values and their Triton
-    types from the context."" "
-    args = list(ctx.avals_in)
-    arg_dtypes = list(map(get_triton_type, ctx.avals_in))
-    for idx, v in scalar_args.items():
-      args.insert(idx, v)
-      arg_dtypes.insert(idx, "constexpr" if v is None else get_triton_type(v))
-
-    # Extract only the output avals not referenced in the input_output_aliases mapping.
-    strictly_out_avals = [
-      aval
-      for i, aval in enumerate(ctx.avals_out)
-      if i not in input_output_aliases.values()
-    ]
-    args.extend(strictly_out_avals)
-    arg_dtypes.extend(map(get_triton_type, strictly_out_avals))
-
-    return args, arg_dtypes
-  """
-
 
 
 def make_kernel_params(
