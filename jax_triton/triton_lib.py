@@ -602,7 +602,6 @@ class JTJITFunction:
 
   def _make_signature_constexprs(
     self,
-    specialization: list[tuple[str, Any]],
     named_args: dict[str, Any],
     sigvals: list[str],
   ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -708,9 +707,7 @@ class JTJITFunction:
           "implicit output arguments are no longer required for aliased args."
         )
 
-      signature, constexprs = self._make_signature_constexprs(
-        specialization, named_args, sigvals
-      )
+      signature, constexprs = self._make_signature_constexprs(named_args, sigvals)
 
       backend_fields = _BACKEND_OPTIONS_FIELD_NAMES[gpu_target.backend]
       unrecognized = set(kwargs.keys()) - set(named_args.keys()) - backend_fields
