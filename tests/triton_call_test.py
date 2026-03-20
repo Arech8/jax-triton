@@ -111,7 +111,7 @@ class ArgsKwargsTest(parameterized.TestCase):
 
     def assert_correct(a,b):
       if isinstance(a, jax.Array):
-        assert jttl.get_triton_type(a).removeprefix("*") == b.dtype
+        assert jttl.get_triton_type(a) == b.dtype
       elif isinstance(a, tuple):
         assert isinstance(b, tuple)
         assert len(a) == len(b)
