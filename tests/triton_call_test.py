@@ -109,9 +109,11 @@ class ArgsKwargsTest(parameterized.TestCase):
       ctx, [*abs_args, *abs_kwargs], args_kwargs_meta
     )
 
+    # TODO test get_type_id() uniqueness!!!
+
     def assert_correct(a,b):
       if isinstance(a, jax.Array):
-        assert jttl.get_triton_type(a) == b.dtype
+        assert jttl.get_type_id(a) == b.dtype
       elif isinstance(a, tuple):
         assert isinstance(b, tuple)
         assert len(a) == len(b)
@@ -653,7 +655,7 @@ class TritonKernelCallTest(parameterized.TestCase):
     x1, y1 = create_random_inputs([42])
     x2, y2 = create_random_inputs([43])
 
-    compile_ttir_inplace = jt.triton_lib.compile_ttir_inplace
+    compile_ttir_inplace = jttl.compile_ttir_inplace
 
     call_count = [0]
 
@@ -662,7 +664,7 @@ class TritonKernelCallTest(parameterized.TestCase):
       return compile_ttir_inplace(*args, **kwargs)
 
     with mock.patch.object(
-        jt.triton_lib, "compile_ttir_inplace", new=my_compile
+        jttl, "compile_ttir_inplace", new=my_compile
     ):
       _ = fn1(x1, y1)
       self.assertEqual(call_count[0], 1)
@@ -687,7 +689,7 @@ class TritonKernelCallTest(parameterized.TestCase):
           grid=x.size,
       )
 
-    get_or_create_triton_kernel = jt.triton_lib.get_or_create_triton_kernel
+    get_or_create_triton_kernel = jttl.JTJITFunction.get_or_create_triton_kernel
 
     call_count = [0]
 
@@ -696,7 +698,7 @@ class TritonKernelCallTest(parameterized.TestCase):
       return get_or_create_triton_kernel(*args, **kwargs)
 
     with mock.patch.object(
-        jt.triton_lib,
+        jttl.JTJITFunction,
         "get_or_create_triton_kernel",
         new=my_get_or_create_triton_kernel,
     ):

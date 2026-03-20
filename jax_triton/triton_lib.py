@@ -63,6 +63,9 @@ _JAX_TRITON_DUMP_DIR = os.environ.get("JAX_TRITON_DUMP_DIR")
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 
+Grid = Union[int, tuple[int], tuple[int, int], tuple[int, int, int]]
+GridOrLambda = Union[Grid, Callable[[dict[str, Any]], Grid]]
+
 # b/447434580: Exceeding this limit will cause Triton to emit a single trap
 # instruction, which will cause the GPU to hang indefinitely. See
 # triton/third_party/nvidia/lib/NVGPUToLLVM/NVGPUToLLVMPass.cpp;l=718
@@ -89,29 +92,26 @@ _JAX_TO_TRITON_TYPE_MAP = {
 }
 
 
-# The typing system is a bit messy here. First of all, Triton itself uses exact dtypes
-# for arrays, but for scalars (no matter if constexpr, or runtime), it accepts regular
-# Python types only. The actual type of a kernel parameter is determined from the
-# parameter type annotation only. So to feed specialization engine properly, we should
-# typecase scalars to Python types. Caveats:
-# 1. we must respect constexprs as a separate type since it influences specialization
-# 2. Tritons's runtime specialization for scalars unconditionally turns all floats into
+# Use of types is slightly messy here. First of all, Triton itself uses exact dtypes
+# for arrays, but for scalars (no matter if constexpr, or runtime), it accepts native
+# Python objects only. The actual type of a kernel parameter is determined from the
+# parameter type annotation only. So to feed specialization engine properly, we have to
+# typecast all scalars to Python types. Caveats:
+# 1. we must not typecase constexpr as it's a separate type influencing specialization.
+# 2. Triton's runtime specialization for scalars unconditionally turns all floats into
 # fp32. It's unclear if this is a bug or not - the respective code doesn't even have a
 # string to describe fp64. Probably Triton's kernel launcher doesn't support doubles,
 # but JAX's `create_scalar_parameter()` support doubles perfectly well. However, Triton
 # still makes binaries that expect floats only, so there's no point to handle it
-# differently.
-# Fortunately, both (Triton and JAX) use the same likely LLVM/MLIR based type
+# differently. I wonder what would happen if a kernel parameter is annotated as tl.fp64.
+#
+# Fortunately, both (Triton and JAX) use the same (likely LLVM/MLIR based) type
 # identifiers, so the function below serves both goals - for Triton's specialization and
 # for JAX's launcher.
-def get_triton_type(obj: Any) -> str:
-  # not expected to be used with constexprs
-  # if obj is None or isinstance(obj, str):
-  #  return "constexpr"  # these are always constexprs
-  # if isinstance(obj, (tl.constexpr, gl.constexpr)):
-  #  obj = obj.value
-
-  # if isinstance(obj, (jax.core.ShapedArray, state.AbstractRef)):
+def get_type_id(obj: Any) -> str:
+  """Returns a Triton/JAX type identifier for the given object. Expected to be used with
+  run-time values only. Constexprs (string are also constexprs only in Triton) don't
+  need type info."""
   if hasattr(obj, "dtype"):
     return _JAX_TO_TRITON_TYPE_MAP[obj.dtype]
 
@@ -129,27 +129,24 @@ def get_triton_type(obj: Any) -> str:
     else:
       raise ValueError(f"integer overflow representing {obj}")
   if isinstance(obj, float):
-    # Triton unconditionally treat all floats as fp32, see the note above
-    return "fp32"
+    return "fp32"  # Triton unconditionally treat all floats as fp32, see the note above
   raise NotImplementedError(f"could not compute type name for {obj}: {type(obj)}")
 
 
 def to_python_type(arg: Any) -> Any:
-  # Convert TypedInt/TypedFloat subclasses to plain Python types,
-  # as nanobind's strict-mode integer caster rejects subclasses.
+  """Typecasts a scalar to a native Python type."""
+  # Note that typecasting ints/floats to respective types also convert JAX's subclasses
+  # like TypedInt and TypedFloat, which choke nanobind's type caster in a default
+  # strict-mode.
   if isinstance(arg, (bool, np.bool_)):
     arg = bool(arg)
   elif isinstance(arg, (int, np.integer)):
     arg = int(arg)
-  elif isinstance(arg, (float, np.floating)):  # np dtypes are added
-    # to handle possible default values properly too
+  elif isinstance(arg, (float, np.floating)):
     arg = float(arg)
-  # else return as is and let it not necessary fail (constexprs and strings pass)
+  # else return as is and let it possibly, but not necessary fail (constexprs and
+  # strings pass and the rest isn't expected to be here, so sparing cycles on that)
   return arg
-
-
-Grid = Union[int, tuple[int], tuple[int, int], tuple[int, int, int]]
-GridOrLambda = Union[Grid, Callable[[dict[str, Any]], Grid]]
 
 
 def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
@@ -395,9 +392,6 @@ def make_backend(
   return backend, gpu_target, compute_capability
 
 
-# _COMPILED_KERNEL_CACHE = {}  # TODO(cjfj): Convert to LRU cache?
-
-
 #################################### FOR RESEARCH ONLY
 def create_function_from_signature(sig, kparams, backend):
   """
@@ -417,21 +411,11 @@ def create_function_from_signature(sig, kparams, backend):
   for name, kp in zip(sig.parameters.keys(), kparams):
     if kp.is_constexpr:
       specialization.append(f'("constexpr", {name})')
-      # TODO warn if specialization is disallowed
-      # for constexpr functions results are different from what specialize_impl() returns
-      # but due two 2-phase cache key resolution and work of replace_callables(),
-      # the caching ends up being correct. (but still need to test both func passing
-      # variants)
     else:
       is_const = "True" if kp.is_const else "False"
       specialize = "False" if kp.do_not_specialize else "True"
       align = "False" if kp.do_not_specialize_on_alignment else "True"
       ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
-      # note that runtime specialization might generate strings for some values
-      # such as callables, which, if not handled carefully, might produce wrong
-      # attributes later, since `parse_attr(desc)` only checks if the string
-      # description has certain characters.
-      # TODO: how to "fake" callables during tracing time?
       if kp.annotation_type:
         if isinstance(kp.annotation_type, str):
           if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
@@ -557,11 +541,25 @@ class JTJITFunction:
   def signature(self) -> inspect.Signature:
     return self.fn.signature
 
-  def get_binder(
+  def _get_binder(
     self, backend
   ) -> Callable[
     [Any, ..., Any], tuple[dict[str, Any], list[tuple[str, Any]], dict[str, Any]]
   ]:
+    # This is important part needs to be fully understood.
+    # create_function_from_signature() is a very inventive optimization in Triton
+    # that one generates once per kernel a so called binder function that simultaneously
+    # and very efficiently:
+    # 1. assigns default values to all unspecified kernel arguments,
+    # 2. assembles a complete dict of parameter_name->value mapping for all arguments
+    # 3. runs a correct specialization pipeline for all arguments, respecting all
+    # user's annotations.
+    # 4. finds key-value elements of kwargs that don't have a match in the kernel
+    # signature.
+    # The dynamically generated binder function exists purely for performance — it
+    # avoids the overhead of branched algo of building the specialization and
+    # application of defaults on every kernel launch, while still computing the
+    # specialization tuples from the actual runtime argument values.
     if not hasattr(self.fn, "_jT_binder"):
       # In the upstream, a binder is per-device. Since JAX doesn't support mixed
       # execution yet, we can safe ignore it.
@@ -570,31 +568,31 @@ class JTJITFunction:
       )
     return self.fn._jT_binder
 
-  def get_cached_kernel(
+  def _get_cached_kernel(
     self,
     compute_capability: int,
     specialization: list[tuple[str, Any]],
-    options: dict[str, Any],
+    kwargs: dict[str, Any],
   ) -> tuple[str, triton_kernel_call_lib.TritonKernel | None]:
-    if "_cOmpute_capability" in options:  # capsizing is intended!
+    if "_cOmpute_capability" in kwargs:  # capsizing is intended!
       raise ValueError("'_cOmpute_capability' key is reserved in the options/kwargs!")
-    options["_cOmpute_capability"] = compute_capability
+    kwargs["_cOmpute_capability"] = compute_capability
 
     if not hasattr(self.fn, "_jT_kernel_cache_key"):
       self.fn._jT_kernel_cache_key = {}
 
     # two step key resolution is important for supporting callables
     key = triton_runtime_jit.compute_cache_key(
-      self.fn._jT_kernel_cache_key, specialization, options
+      self.fn._jT_kernel_cache_key, specialization, kwargs
     )
-    del options["_cOmpute_capability"]
+    del kwargs["_cOmpute_capability"]
 
     if not hasattr(self.fn, "_jT_kernel_cache"):
       self.fn._jT_kernel_cache = {}
 
     return key, self.fn._jT_kernel_cache.get(key, None)
 
-  def add_cached_kernel(
+  def _cache_kernel(
     self,
     key: str,
     kernel: triton_kernel_call_lib.TritonKernel,
@@ -602,49 +600,16 @@ class JTJITFunction:
     assert isinstance(self.fn._jT_kernel_cache, dict)
     self.fn._jT_kernel_cache[key] = kernel
 
-  def try_get_specialized_kernel(
-    self, backend, compute_capability: int, args: list[Any], kwargs: dict[str, Any]
-  ) -> tuple[
-    str,  # key
-    triton_kernel_call_lib.TritonKernel | None,  # kernel
-    dict[str, Any],  # named_args
-    list[tuple[str, Any]],  # specialization
-    dict[str, Any],  # attrs
-    dict[str, Any],  # non_constexpr
-  ]:
-    named_args, specialization, other_kwargs = self.get_binder(backend)(*args, **kwargs)
-
-    # have to always make attributes, since we need them for launching the kernel
-    attrvals = [x[1] for x in specialization]
-    attrs = triton_runtime_jit.find_paths_if(attrvals, lambda _, x: isinstance(x, str))
-    attrs = {
-      k: backend.parse_attr(triton_runtime_jit.get_iterable_path(attrvals, k))
-      for k in attrs
-    }
-
-    key, kernel = self.get_cached_kernel(
-      compute_capability, specialization, other_kwargs
-    )
-
-    self._sigvals = [x[0] for x in specialization]
-    non_constexprs = triton_runtime_jit.find_paths_if(
-      self._sigvals, lambda _, val: val != "constexpr"
-    )
-    non_constexprs = {
-      path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
-      for path in non_constexprs
-    }
-
-    return key, kernel, named_args, specialization, attrs, non_constexprs
-
-  def make_signature_and_constexprs(
-    self, specialization: list[tuple[str, Any]], named_args: dict[str, Any]
+  def _make_signature_constexprs(
+    self,
+    specialization: list[tuple[str, Any]],
+    named_args: dict[str, Any],
+    sigvals: list[str],
   ) -> tuple[dict[str, Any], dict[str, Any]]:
-    # signature
-    signature = dict(zip(self.arg_names, self._sigvals))
-    # constexprs
+    signature = dict(zip(self.arg_names, sigvals))
+
     constexprs = triton_runtime_jit.find_paths_if(
-      self._sigvals, lambda _, val: val == "constexpr"
+      sigvals, lambda _, val: val == "constexpr"
     )
     constexprs = {
       path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
@@ -652,284 +617,169 @@ class JTJITFunction:
     }
     return signature, constexprs
 
+  @staticmethod
+  def _make_attrs_nonconstexprs_sigvals(
+    backend, specialization: list[tuple[str, Any]], named_args: dict[str, Any]
+  ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    # We have to always make attributes, since we need them for launching the kernel
+    attrvals = [x[1] for x in specialization]
+    attrs = triton_runtime_jit.find_paths_if(attrvals, lambda _, x: isinstance(x, str))
+    attrs = {
+      k: backend.parse_attr(triton_runtime_jit.get_iterable_path(attrvals, k))
+      for k in attrs
+    }
+    # attrs keys are tuples of integers representing a path into the (possibly nested)
+    # kernel argument list as it is seen by the Triton compiler (i.e. including all
+    # constexprs and whatnot, - everything as in the signature)
 
-# TODO make this a method of JTJITFunction
-def get_or_create_triton_kernel(
-  make_gpu_target_func,
-  platform: str,
-  jtkernel: JTJITFunction,
-  args: list[Any],
-  # arg_dtypes: list[str],
-  # scalar_args: dict[int, Any],
-  *,
-  compute_capability: int | None,
-  kwargs: dict[str, Any],
-) -> tuple[triton_kernel_call_lib.TritonKernel, dict[str, Any], dict[str, Any]]:
-  # TODO: some vars below could be removed
-  num_warps = kwargs["num_warps"]
-  num_ctas = kwargs["num_ctas"]
-  assert all(
-    isinstance(v, int) for v in (num_warps, kwargs["num_stages"], num_ctas)
-  )  # sanity
+    sigvals = [x[0] for x in specialization]
+    non_constexprs = triton_runtime_jit.find_paths_if(
+      sigvals, lambda _, val: val != "constexpr"
+    )
+    non_constexprs = {
+      path: triton_runtime_jit.get_iterable_path(list(named_args.values()), path)
+      for path in non_constexprs
+    }
+    return attrs, non_constexprs, sigvals
 
-  backend, gpu_target, compute_capability = make_backend(
-    make_gpu_target_func, compute_capability, num_ctas
-  )
+  def get_or_create_triton_kernel(
+    self,
+    make_gpu_target_func,
+    platform: str,
+    args: list[Any],
+    *,
+    compute_capability: int | None,
+    kwargs: dict[str, Any],
+  ) -> tuple[triton_kernel_call_lib.TritonKernel, dict[str, Any], dict[str, Any]]:
+    num_warps = kwargs["num_warps"]
+    num_ctas = kwargs["num_ctas"]
+    assert all(
+      isinstance(v, int) for v in (num_warps, kwargs["num_stages"], num_ctas)
+    )  # internal sanity check
 
-  key, kernel, named_args, specialization, attrs, non_constexprs = (
-    jtkernel.try_get_specialized_kernel(backend, compute_capability, args, kwargs)
-  )
-
-  """
-  # TODO(Arech): triton.runtime.jit.create_function_from_signature() is better here
-  # The binder it generates takes kernel positional argument values (need to pass args here)
-  # and all kwargs passed to the triton's launcher
-  # and returns a tuple of 3: 1 is a dict kernel_param_name->value mapping each
-  # (positional and key-value) argument name to its value; 2 is a list of
-  # specializations; 3 seems to be just forwarding of the options/kwargs back.
-  # The dynamically generated binder function exists purely for performance — it avoids
-  # the overhead of branched algo of building the specialization and application of
-  # defaults on every kernel launch, while still computing the specialization tuples
-  # from the actual runtime argument values.
-  #
-  # A specialization is a list[tuple[str, Any]], one entry per kernel parameter, that
-  # captures two things about each argument at call time:
-  #   1. Element 0 — the type string: e.g. "i32", "i64", "*fp16", "*ki32"
-  #     (pointer to const), "u1", "fp32", "constexpr", "tensordesc<...>".
-  #   2. Element 1 — the specialization value (the "key"): an attribute that may trigger
-  #     a separately compiled kernel variant. Currently possible values are:
-  #     - None — no runtime specialization (used for bools, floats, do_not_specialize
-  #         params)
-  #     - "D" — value/pointer is divisible by 16 (alignment hint)
-  #     - "" (empty string) — value/pointer is NOT divisible by 16
-  #     - The actual Python value itself — for constexpr parameters and integer-valued 1
-  #     - A cache_key — for JITCallable (nested kernel) arguments. Note that in that
-  #         case the specialization value is a hash string (hopefully!!! lowercase).
-  #         Likely by a coincidence this doesn't hurt to `attrs` building later!
-  # The specialization values are determined at call time by native_specialize_impl in
-  # C++ (triton/python/src/specialize.cc).
-  # Specialization serves 3 goals: (1) affect kernel caching key, (2) discover additional
-  # vars to be turned into constexprs by the compiler, (3) source for `attrs` spec.
-  #
-  # Their implementation handle params better, but we likely can't use their code since
-  # they supply an argument value to specialize_impl() directly, while we can't do it
-  # due to how jit compilation with traced values work, which doesn't even have actual
-  # argument values, that's why the below code uses fake value of types.SimpleNamespace.
-  # Also we only specialize runtime arguments (not constexprs!), while their impl does
-  # it for everything.
-
-  signature = {fn.arg_names[i]: v for i, v in enumerate(arg_dtypes)}
-  
-  # We assume that all arrays are aligned to 16 bytes, and Triton may use this
-  # assumption, unless array args are include in the `do_not_specialize` list.
-  #
-  # Note that alignments, specialization and attrs (which are essentially alignment
-  # optimization hints now) make sense and are computed only for positional/non-constexpr
-  # arguments of the kernel! For constexprs compiler doesn't need this, as it has the
-  # value itself.
-  alignments = [16] * len(arg_dtypes)
-  for i in scalar_args:
-    alignments[i] = 0
-  specialize_impl = _triton.native_specialize_impl
-  is_const = False  # set as tl.const type hints and marks read-only data
-  do_specialize = True
-  specialization = tuple(
-      specialize_impl(
-          backend,
-          types.SimpleNamespace(
-              data_ptr=lambda: alignment, dtype=arg_dtype.removeprefix("*")
-          ) if alignment>0 else arg_value,
-          is_const,
-          do_specialize,
-          alignment > 0,
-      )
-      for arg_dtype, alignment, arg_value in zip(arg_dtypes, alignments, args)
-  )
-  # TODO now by passing actual value for a scalar it might be out of sync with how we
-  # process constexprs. Fix this by improving specialization and getting constexpr status from it.
-
-  attrs = {
-      (i,): backend.parse_attr(attr)
-      for i, (_, attr) in enumerate(specialization) if isinstance(attr, str)
-      # attr could be None if specialization is disabled, or when an arg value is None.
-      # Attributes for these doesn't make sense, and the upstream uses a similar check.
-  }
-  # attrs keys are tuples of integers representing a path into the (possibly nested)
-  # kernel argument list as it is seen by the Triton compiler (i.e. including all
-  # constexprs and whatnot, - everything as in the signature)
-
-  constexpr_names = [p.name for p in fn.params if p.is_constexpr]
-
-  constexprs = { k:v for k,v in metaparams.items() if k in constexpr_names}
-  # note that original Triton passes _all_ arguments (including constexprs) through the
-  # specialization pipeline and that could turn certain runtime vars with value of None
-  # or 1 into constexprs. And then for the purposes of kernel compiling it decides what
-  # constexpr and what isn't from the specialization results only!
-  # We are short-cutting this, but perhaps we shouldn't, since it might make the
-  # behavior incoherent. Also the short-cutting requires us to put constexprs into
-  # kernel caching key due to that
-
-  # None args are treated as constexprs in the original specialize.cc:L481
-  # args==1 are also treated as constexprs IFF specialization is enabled in
-  # specialize.cc:L238. The rationale is that 1s are extremely common as strides or
-  # sizes, so it's very beneficial to compile that as a special case
-  constexprs.update({fn.arg_names[i]: v for i, v in scalar_args.items() if v == 1 or v is None})
-
-  # adding constexprs info to the signature
-  for constant in constexprs:
-    signature[constant] = "constexpr"
-
-  # TODO here's what we need eventually to properly cache, compile and launch a kernel:
-  # - kernel func signature dict {kernel param name -> data type} built from a rt made
-  #     specialization
-  # - `attrs` dict built from a runtime made specialization list
-  # - constexprs dict {kernel param name -> constexpr value}, built from explicit
-  #     metaparams, default values, and a runtime made specialization list
-  # - backend options dict, built exclusively from metaparams passed
-  # - renewed args + args_dtypes lists (having specialized constexprs removed and
-  #     defaults added).
-  # 
-  # Intermediates:
-  # - runtime made specialization list.
-
-  # NOTE: To properly add defaults to rt-scalars requires:
-  # - adding a default value to output arg too. We could have a convention to set it to
-  #   None and verify that in the binder generating method during signature inspection.
-  # - args and args_dtypes lists in extract_avals() can no longer be built from
-  #   positional args (ctx.avals..) directly, but must be built from inspecting the
-  #   signature and explicitly matching `strictly_out_avals` to the last
-  #   `len(strictly_out_avals)` parameters backwards from the first constexpr argument.
-  # - we must call generated binder function strictly using key-value arg notation to
-  #   allow for correct argument matching.
-  # - the generated binder function must check that none of outputs must have a value of
-  #   None
-  # Triton gets away with that by not requiring the outputs go last in the list of rt
-  # arguments, so absent rt args get their defaults naturally (similarly no issues
-  # to build named_args=dict(zip(self.arg_names, args)) in the autotuner - it just lacks
-  # rt args with defaults to be set later). We (at this moment) must
-  # specify outputs and they are always after in and in/out args, so to let the binder
-  # match param names, we must call it using key-value representation of args...
-
-  # TODO: generated binder function. Care for output arguments, JAX tracers and scalars.
-  #  We need from it:
-  
-  #
-  # TODO: extract constexprs from rt-args specialization too
-  # 
-  # TODO: return which args must be skipped from sending to the kernel due to turning
-  # into constexprs.
-
-  # TODO: 2 phase cache key resolution and store all that in the `fn` object itself.
-  # Cache must include everything affecting
-  # compilation, i.e.: specializations for runtime args, list of constexprs, backend
-  # options, compute capability... what else?
-  # Param datatypes/signature is already in specialization and constexprs
-
-  # Cache key should contain any parameter that can affect the compiler output.
-  cache_key = (
-      jtkernel.fn,
-      # tuple(signature.items()),
-      specialization,
-
-      # TODO fix this either by using a full specialization, or shorten to only use
-      # added to constexprs vars
-      tuple(constexprs.items()),
-      #num_warps,
-      #num_stages,
-      #num_ctas,
-      compute_capability,
-      #enable_fp_fusion,
-      #tuple(metaparams.items()),
-      str(metaparams), # might be unhashable. Upstream does str()
-  )
-  kernel = _COMPILED_KERNEL_CACHE.get(cache_key)
-  """
-
-  if kernel is None:
-    # First, check that the kernel signature and the reconstructed signature have the
-    # same number of parameters. A mismatch can occur due to differences in
-    # `triton_call(input_output_aliases=)` handling between jax-triton versions.
-    if len(jtkernel.params) != len(named_args):
-      raise TypeError(
-        f"Number of parameters in the kernel '{jtkernel.fn}' signature "
-        f"({len(jtkernel.params)}: {jtkernel.signature}) "
-        f"does not match reconstructed signature ({len(named_args)}: {list(named_args.keys())}). "
-        "If the kernel was working on an older version of jax-triton and its "
-        "triton_call() launcher uses `input_output_aliases` argument, note that "
-        "implicit output arguments are no longer required for aliased args."
-      )
-
-    backend_fields = _BACKEND_OPTIONS_FIELD_NAMES[gpu_target.backend]
-    unrecognized = set(kwargs.keys()) - set(named_args.keys()) - backend_fields
-    if len(unrecognized) > 0:
-      raise ValueError(
-        f"Unknown backend options: '{ {k: kwargs[k] for k in unrecognized} }' "
-        f"were found in kwargs! Known options are: {backend_fields}."
-      )
-
-    backend_options = backend.parse_options(kwargs)
-
-    if _JAX_TRITON_DUMP_DIR:
-      kernel_hash = abs(hash(key))
-      os.makedirs(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}")
-      with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/config", "w") as f:
-        pprint.pprint(key, stream=f)
-        pprint.pprint(backend_options, stream=f)
-
-    context = _triton.ir.context()
-    _triton.ir.load_dialects(context)
-    backend.load_dialects(context)
-    codegen_fns = backend.get_codegen_implementation(backend_options)
-
-    signature, constexprs = jtkernel.make_signature_and_constexprs(
-      specialization, named_args
+    backend, gpu_target, compute_capability = make_backend(
+      make_gpu_target_func, compute_capability, num_ctas
     )
 
-    real_ASTSource = gl_runtime.GluonASTSource if jtkernel.is_gluon else tc.ASTSource
-    module = real_ASTSource(
-      jtkernel.fn, constexprs=constexprs, signature=signature, attrs=attrs
-    ).make_ir(
-      gpu_target, backend_options, codegen_fns, backend.get_module_map(), context
+    named_args, specialization, other_kwargs = self._get_binder(backend)(
+      *args, **kwargs
+    )
+    # named_args is complete dict of kernel param names -> actual values.
+    # other_kwargs is the kwargs with keys corresponding to kernel parameters removed
+    # specialization is a list[tuple[str, Any]], one entry per kernel parameter, that
+    # captures two things about each argument at call time:
+    #   1. Element 0 — the type string: e.g. "i32", "i64", "*fp16", "*ki32"
+    #     (pointer to const), "u1", "fp32", "constexpr", "tensordesc<...>".
+    #   2. Element 1 — the specialization value (the "key"): an attribute that may
+    #     trigger a separately compiled kernel variant. Currently possible values are:
+    #     - None — no runtime specialization (used for bools, floats, do_not_specialize
+    #         params)
+    #     - "D" — value/pointer is divisible by 16 (alignment hint)
+    #     - "" (empty string) — value/pointer is NOT divisible by 16
+    #     - The actual Python value itself — for constexpr parameters and int(1)
+    #     - A cache_key — for JITCallable (nested kernel) arguments. Note that in that
+    #         case the specialization value is a hash string (hopefully!!! lowercase).
+    #         Likely by a coincidence this doesn't hurt to `attrs` building later!
+    # The specialization values are determined at call time by native_specialize_impl in
+    # C++ (triton/python/src/specialize.cc).
+    # Specialization serves 3 goals: (1) affect kernel caching key, (2) discover
+    # additional vars to be turned into constexprs by the compiler, (3) source for the
+    # `attrs` spec.
+
+    attrs, non_constexprs, sigvals = self._make_attrs_nonconstexprs_sigvals(
+      backend, specialization, named_args
     )
 
-    ttir = str(module)
-
-    compilation_result = compile_ttir_inplace(
-      module, backend, backend_options, compute_capability, platform
+    key, kernel = self._get_cached_kernel(
+      compute_capability, specialization, other_kwargs
     )
 
-    kernel_name = compilation_result.name
-    if _JAX_TRITON_DUMP_DIR:
-      with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.ttir", "w") as f:
-        f.write(ttir)
-      with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.ptx", "w") as f:
-        f.write(compilation_result.binary)
-      with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.ttgir", "w") as f:
-        f.write(compilation_result.ttgir)
-      with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.llir", "w") as f:
-        f.write(compilation_result.llir)
-      with open(
-        f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.compile_info",
-        "w",
-      ) as f:
-        f.write(
-          f"{kernel_name}: shared_mem_bytes: {compilation_result.shared_mem_bytes}\n"
+    if kernel is None:
+      # First, check that the kernel signature and the reconstructed signature have the
+      # same number of parameters. A mismatch can occur due to differences in
+      # `triton_call(input_output_aliases=)` handling between jax-triton versions.
+      if len(self.params) != len(named_args):
+        raise TypeError(
+          f"Number of parameters in the kernel '{self.fn}' signature "
+          f"({len(self.params)}: {self.signature}) "
+          f"does not match reconstructed signature ({len(named_args)}: {list(named_args.keys())}). "
+          "If the kernel was working on an older version of jax-triton and its "
+          "triton_call() launcher uses `input_output_aliases` argument, note that "
+          "implicit output arguments are no longer required for aliased args."
         )
 
-    kernel = triton_kernel_call_lib.TritonKernel(
-      kernel_name,
-      num_warps,
-      num_ctas,
-      compilation_result.shared_mem_bytes,
-      compilation_result.binary,
-      ttir,
-      compute_capability,
-    )
+      signature, constexprs = self._make_signature_constexprs(
+        specialization, named_args, sigvals
+      )
 
-    # _COMPILED_KERNEL_CACHE[cache_key] = kernel
-    jtkernel.add_cached_kernel(key, kernel)
+      backend_fields = _BACKEND_OPTIONS_FIELD_NAMES[gpu_target.backend]
+      unrecognized = set(kwargs.keys()) - set(named_args.keys()) - backend_fields
+      if len(unrecognized) > 0:
+        raise ValueError(
+          f"Unknown backend options: '{ {k: kwargs[k] for k in unrecognized} }' "
+          f"were found in kwargs! Known options are: {backend_fields}."
+        )
 
-  return kernel, attrs, non_constexprs
+      backend_options = backend.parse_options(kwargs)
+
+      if _JAX_TRITON_DUMP_DIR:
+        kernel_hash = abs(hash(key))
+        os.makedirs(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}")
+        with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/config", "w") as f:
+          pprint.pprint(key, stream=f)
+          pprint.pprint(backend_options, stream=f)
+
+      context = _triton.ir.context()
+      _triton.ir.load_dialects(context)
+      backend.load_dialects(context)
+      codegen_fns = backend.get_codegen_implementation(backend_options)
+
+      real_ASTSource = gl_runtime.GluonASTSource if self.is_gluon else tc.ASTSource
+      module = real_ASTSource(
+        self.fn, constexprs=constexprs, signature=signature, attrs=attrs
+      ).make_ir(
+        gpu_target, backend_options, codegen_fns, backend.get_module_map(), context
+      )
+
+      ttir = str(module)
+
+      compilation_result = compile_ttir_inplace(
+        module, backend, backend_options, compute_capability, platform
+      )
+
+      kernel_name = compilation_result.name
+      if _JAX_TRITON_DUMP_DIR:
+        with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.ttir", "w") as f:
+          f.write(ttir)
+        with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.ptx", "w") as f:
+          f.write(compilation_result.binary)
+        with open(
+          f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.ttgir", "w"
+        ) as f:
+          f.write(compilation_result.ttgir)
+        with open(f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.llir", "w") as f:
+          f.write(compilation_result.llir)
+        with open(
+          f"{_JAX_TRITON_DUMP_DIR}/{kernel_hash}/{kernel_name}.compile_info",
+          "w",
+        ) as f:
+          f.write(
+            f"{kernel_name}: shared_mem_bytes: {compilation_result.shared_mem_bytes}\n"
+          )
+
+      kernel = triton_kernel_call_lib.TritonKernel(
+        kernel_name,
+        num_warps,
+        num_ctas,
+        compilation_result.shared_mem_bytes,
+        compilation_result.binary,
+        ttir,
+        compute_capability,
+      )
+
+      self._cache_kernel(key, kernel)
+
+    return kernel, attrs, non_constexprs
 
 
 def make_autotuner_configs(
@@ -1148,10 +998,9 @@ def triton_kernel_call_lowering(
 
   kernel_calls = []
   for params in kernel_params:
-    kernel, specialization_attr, non_constexprs = get_or_create_triton_kernel(
+    kernel, specialization_attr, non_constexprs = jtkernel.get_or_create_triton_kernel(
       make_gpu_target_func,
       ctx.module_context.platforms[0],
-      jtkernel,
       args,
       compute_capability=compute_capability,
       kwargs=dict(params["metaparams"]),
@@ -1173,7 +1022,7 @@ def triton_kernel_call_lowering(
           )
         )
       else:
-        dtype = get_triton_type(arg)
+        dtype = get_type_id(arg)
         call_params.append(triton_kernel_call_lib.create_scalar_parameter(arg, dtype))
 
     kernel_calls.append(
@@ -1417,7 +1266,7 @@ class JTArray:
   _default_alignment = 16
 
   def __init__(self, aval):
-    self.dtype = get_triton_type(aval)
+    self.dtype = get_type_id(aval)
     # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
     self.data_ptr = lambda: JTArray._default_alignment
     # self.shape = aval.shape  # might be redundant
