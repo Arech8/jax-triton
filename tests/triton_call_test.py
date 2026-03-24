@@ -27,6 +27,7 @@ import jax_triton.triton_lib as jttl
 import numpy as np
 import triton
 import triton.language as tl
+import types
 
 config.parse_flags_with_absl()
 
@@ -103,7 +104,7 @@ class ArgsKwargsTest(parameterized.TestCase):
             return jax.core.ShapedArray(v.shape, v.dtype)
         assert False, f"Index {i} out of range"
 
-    ctx = jttl.types.SimpleNamespace(avals_in=FakeAvals())
+    ctx = types.SimpleNamespace(avals_in=FakeAvals())
 
     dargs, dkwargs = jttl.deserialize_args_kwargs(
       ctx, [*abs_args, *abs_kwargs], args_kwargs_meta

@@ -25,15 +25,13 @@ import inspect
 import os
 import pprint
 import tempfile
-import types
 from typing import Any, Protocol, Union
 import zlib
 
-from absl import logging
+# from absl import logging
 import jax
 from jax import tree_util
 from jax._src import core
-from jax._src import state
 from jax._src import util
 from jax._src.lib import gpu_triton as triton_kernel_call_lib
 import jax.extend as jex
@@ -778,6 +776,40 @@ class JTJITFunction:
 
     return kernel, attrs, non_constexprs
 
+  @staticmethod
+  def add_output_args(
+    ctx,
+    input_output_aliases: dict[int, int],
+    output_names: tuple[str, ...] | None,
+    args: list[Any],
+    kwargs: dict[str, Any],
+  ) -> tuple[list[Any], dict[str, Any]]:
+    """Add output arguments to the argument list/dictionary."""
+    # Note we should use only the output avals not referenced in the
+    # input_output_aliases mapping.
+    if output_names is None:
+      # We don't have information where the output parameters really are, so we can only
+      # assume they follow positional args passed to `.triton_call()`.
+      args.extend([
+        JTArray(aval)
+        for i, aval in enumerate(ctx.avals_out)
+        if i not in input_output_aliases.values()
+      ])
+    else:
+      assert len(output_names) == len(ctx.avals_out), (
+        "output_names and out_shapes must have the same length"
+      )
+      assert all(oarg not in kwargs for oarg in output_names), (
+        "Output arguments are implicit and should not be passed!"
+      )
+      kwargs.update({
+        oarg: JTArray(ctx.avals_out[i])
+        for i, oarg in enumerate(output_names)
+        if i not in input_output_aliases.values()
+      })
+
+    return args, kwargs
+
 
 def make_autotuner_configs(
   fn: autotuner.Autotuner,
@@ -887,13 +919,13 @@ def make_kernel_params(
       zeroed_outputs(config_metaparams) if zeroed_outputs_callable else zeroed_outputs
     )
 
-    # zeroed_params_with_sizes is a dict output_arg_idx -> aval_size_bytes
+    # zeroed_params_with_sizes is a dict arg_idx -> aval_size_bytes
     # config_zeroed_outputs is a list of ordinal numbers of output arguments
     zeroed_params_with_sizes = {
       output2input[i] if i in output2input else i + outputs_offset: aval_size_bytes(
         ctx.avals_out[i]
       )
-      for i in sorted(config_zeroed_outputs)
+      for i in config_zeroed_outputs
     }
     # TODO turning zeroed_params_with_sizes keys to _array_ indices only (i.e.
     # rely only on ctx.avals_in) will help get rid of dependency on scalars number
@@ -913,17 +945,6 @@ def make_kernel_params(
   return kernel_params
 
 
-# TODO make it a member of JTJITFunction?
-def _add_output_args(ctx, args, input_output_aliases: dict[int, int]):
-  # Extract only the output avals not referenced in the input_output_aliases mapping.
-  args.extend([
-    JTArray(aval)
-    for i, aval in enumerate(ctx.avals_out)
-    if i not in input_output_aliases.values()
-  ])
-  return args
-
-
 def triton_kernel_call_lowering(
   make_gpu_target_func,
   ctx,
@@ -938,18 +959,23 @@ def triton_kernel_call_lowering(
   zeroed_outputs,
   serialized_metadata,
   args_kwargs,
-  # metaparams: tuple[tuple[str, Any], ...],
+  output_names,
 ):
   assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
   input_output_aliases = dict[int, int](input_output_aliases)
 
-  args, kwargs = deserialize_args_kwargs(ctx, abstract_args, args_kwargs)
-  outputs_offset = len(args)  # TODO must be name-based when possible
-  # extending with outputs
-  args = _add_output_args(ctx, args, input_output_aliases)
+  assert output_names is None or (
+    len(output_names) == len(out_shapes) and len(output_names) == len(ctx.avals_out)
+  ), "If output_names set, output_names and out_shapes must have the same length"
 
-  # args, arg_dtypes = extract_avals(ctx, scalar_args, input_output_aliases)
-  # args here mean only positional i.e. non-constexpr args, including scalars.
+  jtkernel = JTJITFunction(fn)
+
+  args, kwargs = deserialize_args_kwargs(ctx, abstract_args, args_kwargs)
+  outputs_offset = len(args)
+  # extending with outputs
+  args, kwargs = jtkernel.add_output_args(
+    ctx, input_output_aliases, output_names, args, kwargs
+  )
 
   if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
     # Note `fn.arg_names` below isn't `JITFunction::arg_names`: Autotuner and
@@ -980,8 +1006,6 @@ def triton_kernel_call_lowering(
     configs = make_configs_from_heuristics(fn, configs, kwargs, named_args)
     fn = fn.fn
 
-  jtkernel = JTJITFunction(fn)
-
   # TODO make_kernel_params might be a method of JTJITFunction
   kernel_params = make_kernel_params(
     ctx,
@@ -1006,7 +1030,6 @@ def triton_kernel_call_lowering(
     call_params = []
     zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
 
-    #for i, (arg, dtype) in enumerate(zip(args, arg_dtypes)):
     for path, arg in non_constexprs.items():
       if isinstance(arg, JTArray):
         assert len(path) == 1, "complex paths are not supported yet"
@@ -1032,46 +1055,12 @@ def triton_kernel_call_lowering(
       )
     )
 
-    """
-    equal_to_1_or_None = {i for i, v in scalar_args.items() if v == 1 or v is None}
-    for i, (arg, dtype) in enumerate(zip(args, arg_dtypes)):
-      if isinstance(arg, core.ShapedArray):
-        arg_attrs = specialization_attr[(i,)]
-        call_params.append(
-          triton_kernel_call_lib.create_array_parameter(
-            zeroed_params_with_sizes.get(i, 0),
-            16 if (["tt.divisibility", 16] in arg_attrs) else 0,
-          )
-        )
-      elif i not in equal_to_1_or_None:
-        # Convert TypedInt/TypedFloat subclasses to plain Python types,
-        # as nanobind's strict-mode integer caster rejects subclasses.
-        if isinstance(arg, bool):
-          arg = bool(arg)
-        elif isinstance(arg, int):
-          arg = int(arg)
-        elif isinstance(arg, (float, np.float32, np.float64)):  # np dtypes are added
-          # to handle possible default values properly too
-          arg = float(arg)
-        call_params.append(triton_kernel_call_lib.create_scalar_parameter(arg, dtype))
-
-    kernel_calls.append(
-      triton_kernel_call_lib.TritonKernelCall(
-        kernel,
-        params["grid"][0],
-        params["grid"][1],
-        params["grid"][2],
-        call_params,
-      )
-    )
-    """
-
   if len(kernel_calls) > 1:
     # named_scalar_args seems to be only used for naming of the autotune call, which is
-    # used only for logging, so it's not important how it handles scalar_args with 1s
-    # and None-s, but still might just need a better name
+    # only used for logging, so this doesn't seem too important use-case to care
+    # specifically about scalars here.
     #named_scalar_args = {fn.arg_names[i]: v for i, v in scalar_args.items()}
-    # TODO do smth to ^^^
+    # TODO agree on that on PR review
 
     input_output_aliases_with_sizes = tuple(
       (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
@@ -1087,13 +1076,15 @@ def triton_kernel_call_lowering(
     kernel_call = kernel_calls[0]
 
   call_proto = kernel_call.to_proto(kernel_call_name, serialized_metadata)
+  # TODO reassemble input_output_aliases properly using actual indices of arrays
+  # passed as arguments. Now triton_call() could specify most of the data through kwargs
+  # so aliases must support names too.
   rule = jax.ffi.ffi_lowering(
     custom_call_target_name,
     api_version=2,
     backend_config=zlib.compress(call_proto),
     operand_output_aliases=input_output_aliases,
   )
-  # Note if needed,array_args could be permuted before passing to the rule()
   return rule(ctx, *abstract_args)
 
 
@@ -1315,7 +1306,7 @@ def triton_call(
     | triton.runtime.Heuristics
     | triton.runtime.Autotuner
   ),
-  out_shape: ShapeDtype | Sequence[ShapeDtype],
+  out_shape: ShapeDtype | Sequence[ShapeDtype] | dict[str, ShapeDtype],
   grid: GridOrLambda,
   name: str = "",
   custom_call_target_name: str = "triton_kernel_call",
@@ -1393,9 +1384,23 @@ def triton_call(
       static values should be annotated with `triton.language.constexpr` or
       `triton.experimental.gluon.language.constexpr`.
     out_shape: A `jax.ShapeDtypeStruct` (or something that has `.shape` and
-      `.dtype` attributes) or a sequence thereof that specify the output(s) of
-      the kernel. Pointers for each of the `jax.ShapeDtypeStruct`s in
-      `out_shape` will be passed into `kernel` following the input parameters.
+      `.dtype` attributes), a sequence thereof or a dictionary mapping from parameter
+      names to `jax.ShapeDtypeStruct` objects that specify shapes and dtypes of the
+      output(s) of the kernel.
+      Contrary to the Triton itself, JAX/XLA must manage memory buffers and organize
+      data copying between host and device memories for all non-constexpr parameters.
+      Also due to JAX custom call APU there's currently a restriction associated with
+      ordering of input/output parameters in the kernel signature: all output arguments
+      must grouped together one after the other and put
+      after all non-constexpr input parameters in the kernel signature. If the
+      `out_shape` uses a dictionary form mapping output parameter name to its
+      shape/dtype characteristics, then there are no other restrictions put in place.
+      The other two forms also require to pass all input non-constexpr arguments
+      strictly as positional `args`.
+      Note that no matter which form of `out_shape` is used, you should not pass any
+      arguments corresponding to strictly output parameters to `triton_call()`, - these
+      arguments are added implicitly by the launcher. If an argument is going to be a
+      combined input AND output argument, set `input_output_aliases` accordingly.
     grid: An integer, tuple of up to 3 integers, or a function that returns a
       tuple of up to 3 integers. When `grid` is an integer, `kernel` is
       invocated in `grid`-many parallel executions. When `grid` is a sequence of
@@ -1434,8 +1439,13 @@ def triton_call(
   """
   if input_output_aliases is None:
     input_output_aliases = {}
+  
+  if isinstance(out_shape, dict):
+    output_names = tuple(out_shape.keys())
+    out_shape = tuple(out_shape.values())
+  else:
+    output_names = None
 
-  # TODO support for outputs naming
   out_shape = tree_util.tree_map(
     lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
@@ -1467,5 +1477,6 @@ def triton_call(
     serialized_metadata=serialized_metadata,
     # metaparams=to_hashable_metaparams(kwargs),
     args_kwargs=args_kwargs_meta,
+    output_names=output_names,
   )
   return tree_util.tree_unflatten(out_tree, out_flat)
