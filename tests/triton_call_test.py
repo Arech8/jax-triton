@@ -642,6 +642,10 @@ class TritonKernelCallTest(parameterized.TestCase):
     fn2 = jax.jit(lambda x, y: add(x, y, BLOCK_SIZE=32, kernel=my_add_kernel))
     fn3 = jax.jit(lambda x, y: add(x, y, BLOCK_SIZE=64, kernel=my_add_kernel))
 
+    jt_kernel = jttl.JTJITFunction(my_add_kernel)
+    jt_cache_size = lambda: jt_kernel.compiled_kernels_cache_size
+    self.assertEqual(jt_cache_size(), 0)
+
     x1, y1 = create_random_inputs([42])
     x2, y2 = create_random_inputs([43])
 
@@ -658,10 +662,15 @@ class TritonKernelCallTest(parameterized.TestCase):
     ):
       _ = fn1(x1, y1)
       self.assertEqual(call_count[0], 1)
+      self.assertEqual(jt_cache_size(), 1)
+
       _ = fn2(x2, y2)
       self.assertEqual(call_count[0], 1)  # Second call hits the cache.
+      self.assertEqual(jt_cache_size(), 1)
+
       _ = fn3(x1, y1)
       self.assertEqual(call_count[0], 2)  # Third call misses (block size).
+      self.assertEqual(jt_cache_size(), 2)
 
   def test_kernel_cache_same_kernel_different_params(self):
     @triton.jit
@@ -669,15 +678,23 @@ class TritonKernelCallTest(parameterized.TestCase):
       pid = tl.program_id(axis=0)
       tl.store(output_ptr + pid, tl.load(x_ptr + pid) + tl.load(y_ptr + pid))
 
-    def silly_add(n):
-      x, y = create_random_inputs([n])
-      return jt.triton_call(
+    def silly_add(n, dtype="float32"):
+      x, y = create_random_inputs([n], dtype=dtype)
+      return (
+        jt.triton_call(
           x,
           y,
           kernel=silly_add_kernel,
           out_shape=x,
           grid=x.size,
+        ),
+        x,
+        y,
       )
+
+    jt_kernel = jttl.JTJITFunction(silly_add_kernel)
+    jt_cache_size = lambda: jt_kernel.compiled_kernels_cache_size
+    self.assertEqual(jt_cache_size(), 0)
 
     get_or_create_triton_kernel = jttl.JTJITFunction.get_or_create_triton_kernel
 
@@ -688,16 +705,31 @@ class TritonKernelCallTest(parameterized.TestCase):
       return get_or_create_triton_kernel(*args, **kwargs)
 
     with mock.patch.object(
-        jttl.JTJITFunction,
-        "get_or_create_triton_kernel",
-        new=my_get_or_create_triton_kernel,
+      jttl.JTJITFunction,
+      "get_or_create_triton_kernel",
+      new=my_get_or_create_triton_kernel,
     ):
-      _ = silly_add(42)
+      ret, x, y = silly_add(42)
+      np.testing.assert_array_equal(ret, x + y)
       self.assertEqual(call_count[0], 1)
-      _ = silly_add(42)
-      self.assertEqual(call_count[0], 1)  # Second call hits the cache.
-      _ = silly_add(43)
-      self.assertEqual(call_count[0], 2)  # Third call misses (grid size).
+      self.assertEqual(jt_cache_size(), 1)
+
+      ret, x, y = silly_add(42)
+      np.testing.assert_array_equal(ret, x + y)
+      self.assertEqual(call_count[0], 1)  # Second call hits the Primitive cache.
+      self.assertEqual(jt_cache_size(), 1)  # and the lowering doesn't even run
+
+      ret, x, y = silly_add(43)
+      np.testing.assert_array_equal(ret, x + y)
+      # Third call differs in grid size and misses the Primitive's cache, but hits
+      # the internal kernel cache
+      self.assertEqual(call_count[0], 2)
+      self.assertEqual(jt_cache_size(), 1)
+
+      ret, x, y = silly_add(42, "int32")
+      np.testing.assert_array_equal(ret, x + y)
+      self.assertEqual(call_count[0], 3)  # Misses both caches due to a different dtype
+      self.assertEqual(jt_cache_size(), 2)
 
   def test_autotune(self):
     autotune_configs = [

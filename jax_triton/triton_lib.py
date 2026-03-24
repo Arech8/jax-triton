@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence, Iterable
+from collections.abc import Callable, Sequence
 import copy
 import dataclasses
 import functools
@@ -390,89 +390,6 @@ def make_backend(
   return backend, gpu_target, compute_capability
 
 
-#################################### FOR RESEARCH ONLY
-def create_function_from_signature(sig, kparams, backend):
-  """
-  - sig is fn.signature, result of inspect.signature(fn)
-  - kparams is fn.params, a list of KernelParam objects
-  - backend is the triton backend object
-
-  Equivalent to sig.bind followed by apply_defaults. This generates a
-  native Python function (using exec) which can be memoized on a per-kernel
-  basis to avoid having to run these expensive functions -- which constitute
-  much of the kernel launch overhead -- every time we run the kernel.
-  """
-  assert len(sig.parameters) == len(kparams)
-  # Create the function argument list and the dict entries for the return statement
-  specialization = []
-  # signature
-  for name, kp in zip(sig.parameters.keys(), kparams):
-    if kp.is_constexpr:
-      specialization.append(f'("constexpr", {name})')
-    else:
-      is_const = "True" if kp.is_const else "False"
-      specialize = "False" if kp.do_not_specialize else "True"
-      align = "False" if kp.do_not_specialize_on_alignment else "True"
-      ret = f"specialize_impl(backend, {name}, {is_const}, {specialize}, {align})"
-      if kp.annotation_type:
-        if isinstance(kp.annotation_type, str):
-          if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
-            # we do not specialize non-constexpr floats and bools:
-            specialize = False
-        if specialize:
-          specialization.append(f'("{kp.annotation_type}",) + {ret}[1:]')
-        else:
-          # skip runtime specialization:
-          specialization.append(f'("{kp.annotation_type}", None)')
-      else:
-        specialization.append(f"{ret}")
-
-  # compute argument string for a given parameter
-  arg = lambda x: (
-    x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
-  )
-  # arg returns a func signature argument declaration reconstructed from the original func
-  # signature - either a param name if it has no default, or param=default_val otherwise
-
-  func_body = f"""
-def dynamic_func({", ".join(list(map(arg, sig.parameters.items())) + ["**options"])}):
-    params = {{{", ".join([f"'{name}': {name}" for name in sig.parameters.keys()])}}}
-    specialization = [{",".join(specialization)}]
-    return params, specialization, options
-"""
-  # order of the func params declaration is determined by the fn signature and then a
-  # blank **options: e.g. "a_ptr, b_ptr, ..., BLOCK_SIZE_M, num_warps, waves_per_eu, ..., **options"
-  #
-  # params var is just a dict mapping fn param name to its value, using the sig object again, e.g.:
-  # "{'a_ptr': a_ptr, ..., 'BLOCK_SIZE_M': BLOCK_SIZE_M, 'num_warps': num_warps, 'waves_per_eu': waves_per_eu, ...}"
-  # We call this named_args and use it very early.
-  #
-  # specialization is a list constructed from either pre-created specialization strings,
-  # or from the result of calling specialize_impl() for each non-constexpr param.
-  # Specializations are used later to extract additional constexprs
-
-  # Prepare defaults to be inserted into function namespace
-  func_namespace = {
-    f"default_{name}": param.default
-    for name, param in sig.parameters.items()
-    if param.default is not inspect.Parameter.empty
-  }
-
-  specialize_impl = _triton.native_specialize_impl
-  func_namespace["specialize_impl"] = specialize_impl
-  func_namespace["backend"] = backend
-  func_namespace["JITCallable"] = triton.runtime.jit.JITCallable
-
-  # Execute the function string in func_namespace to create the function
-  exec(func_body, func_namespace)
-
-  # Extract the newly created function from the namespace
-  return func_namespace["dynamic_func"]
-
-
-#################################### END of FOR RESEARCH ONLY
-
-
 _BACKEND_OPTIONS_FIELD_NAMES = {
   "cuda": frozenset(cb.CUDAOptions.__dataclass_fields__.keys()),
   "hip": frozenset(hb.HIPOptions.__dataclass_fields__.keys()),
@@ -539,33 +456,6 @@ class JTJITFunction:
   def signature(self) -> inspect.Signature:
     return self.fn.signature
 
-  def _get_binder(
-    self, backend
-  ) -> Callable[
-    [Any, ..., Any], tuple[dict[str, Any], list[tuple[str, Any]], dict[str, Any]]
-  ]:
-    # This is important part needs to be fully understood.
-    # create_function_from_signature() is a very inventive optimization in Triton
-    # that one generates once per kernel a so called binder function that simultaneously
-    # and very efficiently:
-    # 1. assigns default values to all unspecified kernel arguments,
-    # 2. assembles a complete dict of parameter_name->value mapping for all arguments
-    # 3. runs a correct specialization pipeline for all arguments, respecting all
-    # user's annotations.
-    # 4. finds key-value elements of kwargs that don't have a match in the kernel
-    # signature.
-    # The dynamically generated binder function exists purely for performance — it
-    # avoids the overhead of branched algo of building the specialization and
-    # application of defaults on every kernel launch, while still computing the
-    # specialization tuples from the actual runtime argument values.
-    if not hasattr(self.fn, "_jT_binder"):
-      # In the upstream, a binder is per-device. Since JAX doesn't support mixed
-      # execution yet, we can safe ignore it.
-      self.fn._jT_binder = triton_runtime_jit.create_function_from_signature(
-        self.fn.signature, self.fn.params, backend
-      )
-    return self.fn._jT_binder
-
   def _get_cached_kernel(
     self,
     compute_capability: int,
@@ -588,6 +478,7 @@ class JTJITFunction:
     if not hasattr(self.fn, "_jT_kernel_cache"):
       self.fn._jT_kernel_cache = {}
 
+    # print("\n\nIN _get_cached_kernel(). Whole cache is:", self.fn._jT_kernel_cache,"\nkey:", key, "\nresult:", self.fn._jT_kernel_cache.get(key, None))
     return key, self.fn._jT_kernel_cache.get(key, None)
 
   def _cache_kernel(
@@ -595,8 +486,14 @@ class JTJITFunction:
     key: str,
     kernel: triton_kernel_call_lib.TritonKernel,
   ):
+    # print("\n\nIN _cache_kernel(). Whole cache is:", self.fn._jT_kernel_cache,"\nAdding key:", key, "\nvalue:", kernel)
     assert isinstance(self.fn._jT_kernel_cache, dict)
     self.fn._jT_kernel_cache[key] = kernel
+
+  @property
+  def compiled_kernels_cache_size(self) -> int:
+    # print("\n\nIN compiled_kernels_cache_size(). Whole cache is:", self.fn._jT_kernel_cache if hasattr(self.fn, "_jT_kernel_cache") else "None")
+    return len(self.fn._jT_kernel_cache) if hasattr(self.fn, "_jT_kernel_cache") else 0
 
   def _make_signature_constexprs(
     self,
@@ -638,6 +535,33 @@ class JTJITFunction:
       for path in non_constexprs
     }
     return attrs, non_constexprs, sigvals
+
+  def _get_binder(
+    self, backend
+  ) -> Callable[
+    [Any, ..., Any], tuple[dict[str, Any], list[tuple[str, Any]], dict[str, Any]]
+  ]:
+    # This is important part needs to be fully understood.
+    # create_function_from_signature() is a very inventive optimization in Triton
+    # that one generates once per kernel a so called binder function that simultaneously
+    # and very efficiently:
+    # 1. assigns default values to all unspecified kernel arguments,
+    # 2. assembles a complete dict of parameter_name->value mapping for all arguments
+    # 3. runs a correct specialization pipeline for all arguments, respecting all
+    # user's annotations.
+    # 4. finds key-value elements of kwargs that don't have a match in the kernel
+    # signature.
+    # The dynamically generated binder function exists purely for performance — it
+    # avoids the overhead of branched algo of building the specialization and
+    # application of defaults on every kernel launch, while still computing the
+    # specialization tuples from the actual runtime argument values.
+    if not hasattr(self.fn, "_jT_binder"):
+      # In the upstream, a binder is per-device. Since JAX doesn't support mixed
+      # execution yet, we can safe ignore it.
+      self.fn._jT_binder = triton_runtime_jit.create_function_from_signature(
+        self.fn.signature, self.fn.params, backend
+      )
+    return self.fn._jT_binder
 
   def get_or_create_triton_kernel(
     self,
