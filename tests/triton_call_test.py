@@ -19,8 +19,7 @@ from absl.testing import absltest
 from absl.testing import parameterized
 from copy import deepcopy
 import jax
-from jax import config
-from jax import random
+from jax import config, random, tree_util
 import jax.numpy as jnp
 import jax_triton as jt
 import jax_triton.triton_lib as jttl
@@ -41,11 +40,9 @@ def tearDownModule():
 
 
 class ArgsKwargsTest(parameterized.TestCase):
-  def test_smoke(self):
-    @triton.jit
-    def kernel(int_, fl, a1, t1, st, t2, t3, t4, a, b, c, d, e, f, g, h):
-      pass
-
+  def test_serialize_deserialize(self):
+    """Test that serialize_args_kwargs() and deserialize_args_kwargs() are inverses of
+    each other, caring about the order of kwargs and args."""
     args = [
       1,
       3.14,
@@ -53,12 +50,16 @@ class ArgsKwargsTest(parameterized.TestCase):
       (3, 4),
       "string",
       (jnp.array([5, 6], dtype=jnp.int16),),
-      (9, jnp.array([7, 8], dtype=jnp.int32),jnp.array([70, 80], dtype=jnp.float32)),
+      (9, jnp.array([7, 8], dtype=jnp.int32), jnp.array([70, 80], dtype=jnp.float32)),
       (10, (jnp.array([7, 8], dtype=jnp.int64), 11)),
     ]
-    kwargs = {
+    kwargs = {  # keys aren't in the order of declaration in the signature
       "b": 3.14,
-      "g": (9, jnp.array([7, 8], dtype=jnp.uint32),jnp.array([70, 80], dtype=jnp.float16)),
+      "g": (
+        9,
+        jnp.array([7, 8], dtype=jnp.uint32),
+        jnp.array([70, 80], dtype=jnp.float16),
+      ),
       "h": (10, (jnp.array([7, 8], dtype=jnp.uint64), 11)),
       "a": 1,
       "e": "string",
@@ -66,53 +67,43 @@ class ArgsKwargsTest(parameterized.TestCase):
       "d": (3, 4),
       "f": (jnp.array([5, 6], dtype=jnp.uint16),),
     }
-    abs_args, abs_kwargs, args_kwargs_meta = jttl.serialize_args_kwargs(
-      kernel, args, deepcopy(kwargs)
-    )
-    
+    # kwargs are expected to be sorted
+    @triton.jit
+    def kernel(int_, fl, a1, t1, st, t2, t3, t4, *, a, b, c, d, e, f, g, h):
+      pass
+
     class FakeAvals:
-      @staticmethod
-      def _traverse(a, i, cnt):
-        if isinstance(a, jax.Array):
-          cnt += 1
-          if i == cnt:
-            return cnt, a
-        elif isinstance(a, tuple):
-          for b in a:
-            if isinstance(b, jax.Array):
-              cnt += 1
-              if i == cnt:
-                return cnt, b
-            elif isinstance(b, tuple):
-              for c in b:
-                if isinstance(c, jax.Array):
-                  cnt += 1
-                  if i == cnt:
-                    return cnt, c
-        return cnt, None
+      def __init__(self):
+        # extracting only arrays from args sequence in kernel's signature order.
+        # This ensures that during ser/des, arrays are ordered in signature's
+        # order too, so no further reshuffling to match signature order to call the
+        # kernel is needed.
+        self.flat = [
+          v
+          for v in tree_util.tree_flatten((
+            args,
+            {k: kwargs[k] for k in sorted(kwargs.keys())},  # restore signature order
+          ))[0]
+          if isinstance(v, jax.Array)
+        ]
+
+        # check the core test assumption that types in args are unique and get_type_id()
+        # is a bijection.
+        unique_types = frozenset(jttl.get_type_id(v) for v in self.flat)
+        assert len(unique_types) == len(self.flat), "Duplicate types in the args sequence"
 
       def __getitem__(self, i):
-        cnt = -1
-        for a in args:
-          cnt, v = self._traverse(a, i, cnt)
-          if v is not None:
-            return jax.core.ShapedArray(v.shape, v.dtype)
+        return self.flat[i]
 
-        for k in sorted(kwargs.keys()):
-          cnt, v = self._traverse(kwargs[k], i, cnt)
-          if v is not None:
-            return jax.core.ShapedArray(v.shape, v.dtype)
-        assert False, f"Index {i} out of range"
-
+    abs_args, abs_kwargs, args_kwargs_meta = jttl.serialize_args_kwargs(
+      kernel, args, deepcopy(kwargs)  # kwargs could be modified, hence must copy
+    )
     ctx = types.SimpleNamespace(avals_in=FakeAvals())
-
     dargs, dkwargs = jttl.deserialize_args_kwargs(
       ctx, [*abs_args, *abs_kwargs], args_kwargs_meta
     )
 
-    # TODO test get_type_id() uniqueness!!!
-
-    def assert_correct(a,b):
+    def assert_correct(a, b):
       if isinstance(a, jax.Array):
         assert jttl.get_type_id(a) == b.dtype
       elif isinstance(a, tuple):
@@ -131,8 +122,6 @@ class ArgsKwargsTest(parameterized.TestCase):
     assert len(kwargs) == len(dkwargs)
     for k in kwargs.keys():
       assert_correct(kwargs[k], dkwargs[k])
-
-
 
 
 @triton.jit
