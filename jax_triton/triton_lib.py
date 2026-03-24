@@ -95,7 +95,7 @@ _JAX_TO_TRITON_TYPE_MAP = {
 # Python objects only. The actual type of a kernel parameter is determined from the
 # parameter type annotation only. So to feed specialization engine properly, we have to
 # typecast all scalars to Python types. Caveats:
-# 1. we must not typecase constexpr as it's a separate type influencing specialization.
+# 1. we must not typecast constexprs as it's a separate type influencing specialization.
 # 2. Triton's runtime specialization for scalars unconditionally turns all floats into
 # fp32. It's unclear if this is a bug or not - the respective code doesn't even have a
 # string to describe fp64. Probably Triton's kernel launcher doesn't support doubles,
@@ -396,6 +396,60 @@ _BACKEND_OPTIONS_FIELD_NAMES = {
 }
 
 
+class JTKernel:
+  def __init__(self, kernel, triton_call_kwargs):
+    if not isinstance(
+      kernel,
+      (
+        triton.JITFunction,
+        gl_runtime.GluonJITFunction,
+        autotuner.Heuristics,
+        autotuner.Autotuner,
+        JTKernel,
+      ),
+    ):
+      raise ValueError(
+        "`kernel` must be a `JTKernel` or Triton's `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner` object."
+      )
+
+    if isinstance(kernel, JTKernel):
+      triton_call_kwargs = {**kernel.triton_call_kwargs, **triton_call_kwargs}
+      kernel = kernel.kernel
+
+    self.kernel = kernel
+
+    if "grid" in triton_call_kwargs:
+      raise ValueError("grid must be provided as an indexing argument to this object")
+
+    self.triton_call_kwargs = triton_call_kwargs
+
+  def __getitem__(self, grid):
+    return lambda *args, **kwargs: triton_call(
+      kernel=self.kernel, grid=grid, *args, **self.triton_call_kwargs, **kwargs
+    )
+
+def kernel(fn=None, **kwargs):
+  """
+  A decorator that wraps a Triton/Gluon kernel function and returns a JTKernel object
+  preserving kwargs to pass to triton_call() launcher.
+  Can be used in two ways:
+  - @jt.kernel
+    def kernel_func(x, y, z):
+      ...
+  - @jt.kernel(out_names="z")   # or any other set of key-value pairs for triton_call()
+    def kernel_func(x, y, z):
+      ...
+  The JTKernel object can be used to launch the kernel with a given grid using a
+  familiar Triton syntax kernel_func[grid](x, y) (Note that output arguments are still
+  implicit and should not be passed to the launcher)
+  """
+  if len(kwargs) == 0 or fn is not None:
+    if fn is None:
+      raise ValueError("`kernel` decorator must be used with a kernel function")
+    return JTKernel(fn, kwargs)
+
+  return functools.partial(JTKernel, triton_call_kwargs=kwargs)
+
 class JTJITFunction:
   """A wrapper around Triton's JITFunction/GluonJITFunction object to isolate the rest
   of the code from Triton's internals and provide a unified interface to bits needed.
@@ -422,11 +476,11 @@ class JTJITFunction:
     | gl_runtime.GluonJITFunction,
   ):
     # peel off wrappers to get to the JITFunction object
-    self.has_autotuner = isinstance(fn, autotuner.Autotuner)
-    if self.has_autotuner:
+    if isinstance(fn, JTKernel):
+      fn = fn.kernel
+    if isinstance(fn, autotuner.Autotuner):
       fn = fn.fn
-    self.has_heuristics = isinstance(fn, autotuner.Heuristics)
-    if self.has_heuristics:
+    if isinstance(fn, autotuner.Heuristics):
       fn = fn.fn
 
     if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
@@ -704,14 +758,14 @@ class JTJITFunction:
   def add_output_args(
     ctx,
     input_output_aliases: dict[int, int],
-    output_names: tuple[str, ...] | None,
+    out_names: tuple[str, ...] | None,
     args: list[Any],
     kwargs: dict[str, Any],
   ) -> tuple[list[Any], dict[str, Any]]:
     """Add output arguments to the argument list/dictionary."""
     # Note we should use only the output avals not referenced in the
     # input_output_aliases mapping.
-    if output_names is None:
+    if out_names is None:
       # We don't have information where the output parameters really are, so we can only
       # assume they follow positional args passed to `.triton_call()`.
       args.extend([
@@ -720,15 +774,15 @@ class JTJITFunction:
         if i not in input_output_aliases.values()
       ])
     else:
-      assert len(output_names) == len(ctx.avals_out), (
+      assert len(out_names) == len(ctx.avals_out), (
         "output_names and out_shapes must have the same length"
       )
-      assert all(oarg not in kwargs for oarg in output_names), (
+      assert all(oarg not in kwargs for oarg in out_names), (
         "Output arguments are implicit and should not be passed!"
       )
       kwargs.update({
         oarg: JTArray(ctx.avals_out[i])
-        for i, oarg in enumerate(output_names)
+        for i, oarg in enumerate(out_names)
         if i not in input_output_aliases.values()
       })
 
@@ -883,14 +937,14 @@ def triton_kernel_call_lowering(
   zeroed_outputs,
   serialized_metadata,
   args_kwargs,
-  output_names,
+  out_names,
 ):
   assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
   input_output_aliases = dict[int, int](input_output_aliases)
 
-  assert output_names is None or (
-    len(output_names) == len(out_shapes) and len(output_names) == len(ctx.avals_out)
-  ), "If output_names set, output_names and out_shapes must have the same length"
+  assert out_names is None or (
+    len(out_names) == len(out_shapes) and len(out_names) == len(ctx.avals_out)
+  ), "If out_names set, out_names and out_shapes must have the same length"
 
   jtkernel = JTJITFunction(fn)
 
@@ -898,7 +952,7 @@ def triton_kernel_call_lowering(
   outputs_offset = len(args)
   # extending with outputs
   args, kwargs = jtkernel.add_output_args(
-    ctx, input_output_aliases, output_names, args, kwargs
+    ctx, input_output_aliases, out_names, args, kwargs
   )
 
   if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
@@ -1232,6 +1286,7 @@ def triton_call(
   ),
   out_shape: ShapeDtype | Sequence[ShapeDtype] | dict[str, ShapeDtype],
   grid: GridOrLambda,
+  out_names: None | str | tuple[str, ...] = None,
   name: str = "",
   custom_call_target_name: str = "triton_kernel_call",
   num_warps: int | None = None,
@@ -1301,9 +1356,8 @@ def triton_call(
       positional arguments in the order they are declared in the kernel signature,
       except for purely output arguments that are allocated and passed to the kernel
       implicitly (user do not need to pass them explicitly). In the kernel signature,
-      purely output parameters should be anywhere after the last input array parameter.
-      Scalar values can be passed as positional arguments in this sequence, or as
-      key-value arguments.
+      purely output parameters should be after the last input parameter to be passed as
+      a positional argument to `triton_call()`.
     kernel: A Triton kernel (e.g. a function decorated with `triton.jit`). All
       static values should be annotated with `triton.language.constexpr` or
       `triton.experimental.gluon.language.constexpr`.
@@ -1325,6 +1379,10 @@ def triton_call(
       arguments corresponding to strictly output parameters to `triton_call()`, - these
       arguments are added implicitly by the launcher. If an argument is going to be a
       combined input AND output argument, set `input_output_aliases` accordingly.
+    out_names: Another way to specify the output parameter names of the kernel. This one
+      is useful to employ in conjunction with @kernel decorator.
+      If `out_shape` is a dictionary, `out_names` must be a tuple of the same keys.
+      Order of the names doesn't matter as it's determined by the kernel's signature.
     grid: An integer, tuple of up to 3 integers, or a function that returns a
       tuple of up to 3 integers. When `grid` is an integer, `kernel` is
       invocated in `grid`-many parallel executions. When `grid` is a sequence of
@@ -1363,18 +1421,28 @@ def triton_call(
   """
   if input_output_aliases is None:
     input_output_aliases = {}
-  
+
+  if isinstance(out_names, str):
+    out_names = (out_names,)
+  if out_names is not None and not isinstance(out_names, tuple):
+    raise ValueError("out_names must be a tuple of strings or None")
+
   if isinstance(out_shape, dict):
-    output_names = tuple(out_shape.keys())
+    if out_names is None:
+      out_names = tuple(out_shape.keys())
+    else:
+      if frozenset(out_names) != frozenset(out_shape.keys()):
+        raise ValueError("out_names and out_shape must have the same keys")
     out_shape = tuple(out_shape.values())
-  else:
-    output_names = None
+  # else we have to delay the check, or spend cycles on making an iterable
 
   out_shape = tree_util.tree_map(
     lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
   # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
+  if out_names is not None and len(out_names) != len(flat_out_shapes):
+    raise ValueError("out_shape and out_names must have the same length")
 
   # Python guarantees the keys don't exist. The original Triton has a single namespace
   # for both constexprs and backend options, and we're doing the same to unify processing
@@ -1401,6 +1469,6 @@ def triton_call(
     serialized_metadata=serialized_metadata,
     # metaparams=to_hashable_metaparams(kwargs),
     args_kwargs=args_kwargs_meta,
-    output_names=output_names,
+    out_names=out_names,
   )
   return tree_util.tree_unflatten(out_tree, out_flat)

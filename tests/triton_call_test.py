@@ -106,6 +106,7 @@ class ArgsKwargsTest(parameterized.TestCase):
     def assert_correct(a, b):
       if isinstance(a, jax.Array):
         assert jttl.get_type_id(a) == b.dtype
+        # can't test actual values here, they were abstracted away
       elif isinstance(a, tuple):
         assert isinstance(b, tuple)
         assert len(a) == len(b)
@@ -363,21 +364,13 @@ class TritonKernelCallTest(parameterized.TestCase):
 
   @parameterized.parameters(42.0, np.float32(42.0))
   def test_add_float_scalar(self, scalar):
+    @jt.kernel
     @triton.jit
     def add_scalar_kernel(x_ptr, y, output_ptr):
       tl.store(output_ptr, tl.load(x_ptr) + y)
 
-    def add_scalar(x, y):
-      return jt.triton_call(
-          x,
-          y,
-          kernel=add_scalar_kernel,
-          out_shape=jax.ShapeDtypeStruct((), x.dtype),
-          grid=1,
-      )
-
     x = jnp.array([1.0])
-    np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
+    np.testing.assert_allclose(add_scalar_kernel[1](x, scalar, out_shape=x), x + scalar)
 
   @parameterized.product(
     mul=[None, 1, 1.0, 3.14],
@@ -425,25 +418,69 @@ class TritonKernelCallTest(parameterized.TestCase):
       expected += ofs
     np.testing.assert_allclose(y, expected, rtol=2e-07)
 
+  def test_function_arguments(self):
+    # mostly taken from Triton with necessary changes and a test without tl.constexpr
+    @triton.jit
+    def func1():
+        return 1
+
+    @triton.jit
+    def func2():
+        return 2
+
+    @triton.jit
+    def func3(x):
+        return x
+
+    @triton.jit
+    def func4(x, y):
+        return x + y
+
+    @triton.jit  # callables are explicitly constexpr
+    def kernel(fn_args, Y, fn: tl.constexpr):
+        tl.store(Y, fn(*fn_args))
+
+    @triton.jit  # callables aren't annotated (made constexpr automatically)
+    def kernel2(fn_args, Y, fn):
+        tl.store(Y, fn(*fn_args))
+
+    def launch_kernel(fn, fn_args, kernel=kernel):
+      return jt.triton_call(
+        fn_args,
+        fn=fn,
+        kernel=kernel,
+        out_shape=jax.ShapeDtypeStruct((), jnp.int32),
+        grid=1,
+      )
+
+    rets = [None] * 5
+    rets[0] = launch_kernel(func1, tuple())
+    rets[1] = launch_kernel(func2, tuple())
+    rets[2] = launch_kernel(func3, (3, ))
+    rets[3] = launch_kernel(func4, (3, 4))
+    rets[4] = launch_kernel(func1, tuple())
+    self.assertEqual(jttl.JTJITFunction(kernel).compiled_kernels_cache_size, 4)
+    np.testing.assert_array_equal(rets, [1, 2, 3, 7, 1])
+
+    rets = [None] * 5
+    rets[0] = launch_kernel(func1, tuple(), kernel=kernel2)
+    rets[1] = launch_kernel(func2, tuple(), kernel=kernel2)
+    rets[2] = launch_kernel(func3, (3, ), kernel=kernel2)
+    rets[3] = launch_kernel(func4, (3, 4), kernel=kernel2)
+    rets[4] = launch_kernel(func1, tuple(), kernel=kernel2)
+    self.assertEqual(jttl.JTJITFunction(kernel2).compiled_kernels_cache_size, 4)
+    np.testing.assert_array_equal(rets, [1, 2, 3, 7, 1])
+
   def test_explicit_compute_capability(self):
     scalar = np.float32(8)
 
+    @jt.kernel(compute_capability=jt.get_compute_capability(0))
     @triton.jit
     def add_scalar_kernel(x_ptr, y, output_ptr):
       tl.store(output_ptr, tl.load(x_ptr) + y)
 
-    def add_scalar(x, y):
-      return jt.triton_call(
-          x,
-          y,
-          kernel=add_scalar_kernel,
-          compute_capability=jt.get_compute_capability(0),
-          out_shape=jax.ShapeDtypeStruct((), x.dtype),
-          grid=1,
-      )
-
     x = jnp.array([1.0])
-    np.testing.assert_allclose(add_scalar(x, scalar), x + scalar)
+    np.testing.assert_allclose(add_scalar_kernel[1](x, scalar, out_shape=x), x + scalar)
 
   def test_single_namespace_for_constexprs_and_backend_options(self):
     """Checks that metaparams of triton_call() are passed to the kernel and to backend
@@ -619,6 +656,7 @@ class TritonKernelCallTest(parameterized.TestCase):
     np.testing.assert_allclose(out, x)
 
   def test_multiple_outputs(self):
+    @jt.kernel
     @triton.jit
     def copy_twice_kernel(a_ptr, x_ptr, y_ptr):
       a = tl.load(a_ptr)
@@ -626,12 +664,7 @@ class TritonKernelCallTest(parameterized.TestCase):
       tl.store(y_ptr, a)
 
     a = jnp.array([42])
-    x, y = jt.triton_call(
-        a,
-        kernel=copy_twice_kernel,
-        out_shape=[a, a],
-        grid=(1,),
-    )
+    x, y = copy_twice_kernel[1](a, out_shape=[a, a])
     np.testing.assert_array_equal(a, x)
     np.testing.assert_array_equal(a, y)
 
@@ -673,6 +706,7 @@ class TritonKernelCallTest(parameterized.TestCase):
       self.assertEqual(jt_cache_size(), 2)
 
   def test_kernel_cache_same_kernel_different_params(self):
+    @jt.kernel(out_names="output_ptr")
     @triton.jit
     def silly_add_kernel(x_ptr, y_ptr, output_ptr):
       pid = tl.program_id(axis=0)
@@ -680,17 +714,7 @@ class TritonKernelCallTest(parameterized.TestCase):
 
     def silly_add(n, dtype="float32"):
       x, y = create_random_inputs([n], dtype=dtype)
-      return (
-        jt.triton_call(
-          x,
-          y,
-          kernel=silly_add_kernel,
-          out_shape=x,
-          grid=x.size,
-        ),
-        x,
-        y,
-      )
+      return silly_add_kernel[x.size](x, y, out_shape=x), x, y
 
     jt_kernel = jttl.JTJITFunction(silly_add_kernel)
     jt_cache_size = lambda: jt_kernel.compiled_kernels_cache_size
