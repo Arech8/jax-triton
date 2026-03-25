@@ -96,7 +96,8 @@ class ArgsKwargsTest(parameterized.TestCase):
         return self.flat[i]
 
     abs_args, abs_kwargs, args_kwargs_meta = jttl.serialize_args_kwargs(
-      kernel, args, deepcopy(kwargs)  # kwargs could be modified, hence must copy
+      jttl.JTJITFunction(kernel), args, deepcopy(kwargs)
+      # kwargs could be modified, hence must copy
     )
     ctx = types.SimpleNamespace(avals_in=FakeAvals())
     dargs, dkwargs = jttl.deserialize_args_kwargs(

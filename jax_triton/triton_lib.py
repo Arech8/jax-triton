@@ -22,6 +22,7 @@ import dataclasses
 import functools
 from functools import cached_property
 import inspect
+import itertools
 import os
 import pprint
 import tempfile
@@ -421,7 +422,57 @@ class JTKernel:
     if "grid" in triton_call_kwargs:
       raise ValueError("grid must be provided as an indexing argument to this object")
 
+    # since this code works only once on a kernel declaration point, we could add as
+    # much validation as possible here, to avoid doing it on every kernel launch instead
+    if "out_names" in triton_call_kwargs:
+      # we rely on a user correctly specifying that the order of elements in "out_names"
+      # reflect that in the kernel's signature. Checking that here as much as possible
+      triton_call_kwargs = self._validate_out_names(triton_call_kwargs)
+
     self.triton_call_kwargs = triton_call_kwargs
+
+  @staticmethod
+  def _validate_out_names(triton_call_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Validates as much as possible the order of elements in
+    triton_call_kwargs['out_names']"""
+    out_names = triton_call_kwargs["out_names"]
+    if isinstance(out_names, (str, int)):
+      out_names = (out_names,)
+    elif isinstance(out_names, list):  # won't do this in triton_call(), but here it
+      out_names = tuple(out_names)  # isn't expensive.
+    elif not isinstance(out_names, tuple):
+      raise ValueError("out_names must be a string, or a tuple of specific format")
+    triton_call_kwargs["out_names"] = out_names
+
+    jtfu = JTJITFunction(kernel)  # refactor this out if other validation funcs appear
+    arg_names = jtfu.arg_names
+    last_idx = -1
+    for i, out_elm in enumerate(out_names):
+      is_tuple = isinstance(out_elm, tuple)
+      if is_tuple and len(out_elm) <= 0:
+        raise ValueError(f"out_names[{i}] must be an nonempty tuple")
+      if is_tuple and any(not isinstance(e, int) for e in out_elm[1:]):
+        raise ValueError(
+          "A tuple form of out_names must contain only ints beyond the first element"
+        )
+      is_first_string = is_tuple and isinstance(out_elm[0], str)
+      if isinstance(out_elm, str) or is_first_string:
+        try:
+          param_idx = arg_names.index(out_elm[0] if is_first_string else out_elm)
+        except ValueError:
+          raise ValueError(f"out_names[{i}] must be a valid kernel parameter name")
+        # without args/kwargs we can't look deeper anyway
+      else:
+        param_idx = out_elm[0] if is_tuple else out_elm
+        if not isinstance(out_elm, int):
+          raise ValueError(f"out_names[{i}] must be an int or a string")
+
+      if param_idx <= last_idx:
+        raise ValueError(
+          "The order of elements in out_names must follow the kernel's signature"
+        )
+      last_idx = param_idx
+    return triton_call_kwargs
 
   def __getitem__(self, grid):
     return lambda *args, **kwargs: triton_call(
@@ -491,12 +542,26 @@ class JTJITFunction:
 
   @cached_property
   def arg_names(self) -> list[str]:
+    """Returns a list of the kernel parameter names in the order they are declared in
+    the kernel's signature."""
     # JITFunction::arg_names is deprecated, as per comment
     return (
       self.fn.arg_names
       if hasattr(self.fn, "arg_names")
       else [p.name for p in self.fn.params]
     )
+
+  @cached_property
+  def arg_name_to_index(self) -> dict[str, int]:
+    """Returns a dictionary mapping the kernel parameter names to their indices in the
+    kernel's signature."""
+    return {name: index for index, name in enumerate(self.arg_names)}
+
+  @cached_property
+  def index_to_arg_name(self) -> dict[int, str]:
+    """Returns a dictionary mapping a kernel parameter index in the kernel's signature
+    to its name."""
+    return dict(enumerate(self.arg_names))
 
   @property  # it's needed only for compiling once, so it's better have this like that
   def params(self) -> list[triton.runtime.jit.KernelParam]:
@@ -946,12 +1011,12 @@ def triton_kernel_call_lowering(
     len(out_names) == len(out_shapes) and len(out_names) == len(ctx.avals_out)
   ), "If out_names set, out_names and out_shapes must have the same length"
 
-  jtkernel = JTJITFunction(fn)
+  jtfu = JTJITFunction(fn)
 
   args, kwargs = deserialize_args_kwargs(ctx, abstract_args, args_kwargs)
   outputs_offset = len(args)
   # extending with outputs
-  args, kwargs = jtkernel.add_output_args(
+  args, kwargs = jtfu.add_output_args(
     ctx, input_output_aliases, out_names, args, kwargs
   )
 
@@ -997,7 +1062,7 @@ def triton_kernel_call_lowering(
 
   kernel_calls = []
   for params in kernel_params:
-    kernel, specialization_attr, non_constexprs = jtkernel.get_or_create_triton_kernel(
+    kernel, specialization_attr, non_constexprs = jtfu.get_or_create_triton_kernel(
       make_gpu_target_func,
       ctx.module_context.platforms[0],
       args,
@@ -1135,7 +1200,7 @@ def from_hashable_metaparams(astuple: tuple[tuple[str, Any], ...]) -> dict[str, 
   return metaparams
 
 
-def serialize_args_kwargs(fn, args: list, kwargs: dict):
+def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   """Prepares args and kwargs for passing through JAX's primitive system by separating
   things that must be traced from things that must be passed as is.
 
@@ -1145,6 +1210,7 @@ def serialize_args_kwargs(fn, args: list, kwargs: dict):
 
   Note that the function consumes kwargs, i.e. its state is modified in place.
   """
+  assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
   # JAX's Primitive.bind(*args, **params) has a strict dichotomy:
   # - *args (positional) are dynamic operands — values that participate in JAX's
   # tracing/transformation system (jit, grad, vmap). During JIT compilation, they become
@@ -1196,7 +1262,7 @@ def serialize_args_kwargs(fn, args: list, kwargs: dict):
 
   abs_kwargs_list = []  # only values to abstract
   abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
-  for aname in JTJITFunction(fn).arg_names:
+  for aname in jtfu.arg_names:
     # if kwargs has that parameter AND the value contains an array somewhere (including
     # nested tuples/lists), we handle the whole arg value differently to be able to
     # reconstruct it correctly. Otherwise we just skip the arg to pass it along with
@@ -1362,27 +1428,32 @@ def triton_call(
       static values should be annotated with `triton.language.constexpr` or
       `triton.experimental.gluon.language.constexpr`.
     out_shape: A `jax.ShapeDtypeStruct` (or something that has `.shape` and
-      `.dtype` attributes), a sequence thereof or a dictionary mapping from parameter
-      names to `jax.ShapeDtypeStruct` objects that specify shapes and dtypes of the
-      output(s) of the kernel.
+      `.dtype` attributes), an ordered sequence thereof, or an *ordered* dictionary
+      mapping from parameter names to `jax.ShapeDtypeStruct` objects that specify shapes
+      and dtypes of the output(s) of the kernel (if `out_names` are used, its ordering
+      takes precedence over ordering of `out_shape` elements).
       Contrary to the Triton itself, JAX/XLA must manage memory buffers and organize
       data copying between host and device memories for all non-constexpr parameters.
       Also due to JAX custom call APU there's currently a restriction associated with
       ordering of input/output parameters in the kernel signature: all output arguments
-      must grouped together one after the other and put
-      after all non-constexpr input parameters in the kernel signature. If the
-      `out_shape` uses a dictionary form mapping output parameter name to its
-      shape/dtype characteristics, then there are no other restrictions put in place.
-      The other two forms also require to pass all input non-constexpr arguments
-      strictly as positional `args`.
-      Note that no matter which form of `out_shape` is used, you should not pass any
-      arguments corresponding to strictly output parameters to `triton_call()`, - these
+      must grouped together one after the other and put after all non-constexpr input
+      parameters in the kernel signature.
+      If `out_shape` uses a dictionary form mapping output parameter name to its
+      shape/dtype characteristics, or if `out_names` is provided, then there are no
+      other restrictions put in place. The other two forms also require that all input
+      non-constexpr arguments are passed strictly as positional `args`.
+      Note that no matter which form of `out_shape` is used, arguments corresponding to
+      strictly output parameters should never be passed to a `triton_call()`, - these
       arguments are added implicitly by the launcher. If an argument is going to be a
       combined input AND output argument, set `input_output_aliases` accordingly.
-    out_names: Another way to specify the output parameter names of the kernel. This one
-      is useful to employ in conjunction with @kernel decorator.
-      If `out_shape` is a dictionary, `out_names` must be a tuple of the same keys.
-      Order of the names doesn't matter as it's determined by the kernel's signature.
+    out_names: Ordered sequence of output parameter specifications. This is another way
+      to specify the output parameter names of the kernel. This one is useful to employ
+      in conjunction with the @kernel decorator when outputs doesn't depend on argument
+      values, and adds a layer of argument order verification, since the decorator could
+      check the order conformance at least on the top level.
+      If `out_shape` is a dictionary, `out_names` must have the same keys. Ordering of
+      `out_names` takes precedence over ordering of `out_shape` elements, since
+      `out_names` is typically a properly of a kernel set through the @kernel decorator.
     grid: An integer, tuple of up to 3 integers, or a function that returns a
       tuple of up to 3 integers. When `grid` is an integer, `kernel` is
       invocated in `grid`-many parallel executions. When `grid` is a sequence of
@@ -1415,34 +1486,182 @@ def triton_call(
     Default values in kernel signature are supported only for scalars, or for output
     arguments (for outputs only the value of None is allowed as a default - this is
     useful when a scalar with a default value needs to precede an output argument).
+    TODO check how Triton actually handle None's in the above case.
+
+    The kernel output specification is a mandatory complexity on top of Triton to
+    interoperate with JAX properly.
+    The old/original jax-triton convention was:
+    :in-spec: is an index of an element in `args` passed to the `triton_call()` as
+      positional arguments. I.e. a raw index into the kernel's signature parameters list
+    :out-spec: is an output array index in a flattened result of the `triton_call()`.
+      I.e. a raw index into a flat sequence of output arrays.
+    In the context of `triton_call()` parameters:
+    - out_shape - ordered sequence of ShapeDtype. Index of an element in the :out-spec:.
+        Hidden feature: a compound form of the out_shape determines the compound form of
+        the result of the call, with flat indices determine the :out-spec:.
+    - input_output_aliases - :in-spec: to :out-spec: mapping, i.e. index->index
+    - zeroed_outputs - list of :out-spec:
+    All params are/can be used internally in input/output array coordinate system (i.e.
+    as indices counting the arrays only, - either inputs or outputs, or concatenated)
+
+    New convention:
+    Kernel's signature coordinate system - a hashable addressing method that allows to
+      correctly identify an element in a random (*args,**kwargs) position, no matter how
+      deeply nested it is to support all Triton features. Must be an extension of the
+      old convention, hence:
+      - a non-negative int - in the input context: the old :in-spec:; in the output
+        context: the old :out-spec:.
+      - a string - identifies a parameter in the kernel's signature. If the
+        corresponding argument is a compound (a tuple), refers to all nested elements
+        of the compound when possible (`out_shape`, `zeroed_outputs`, or for
+        `input_output_aliases` when the source/destination of the mapping has exactly
+        the same number of elements), or errors out.
+      - a tuple, with [0] being a string, as above, identifies a parameter in the
+        kernel's signature; otherwise must be a non-negative int indexing a kernel
+        signature parameter. All other elements of the tuple must
+        be non-negative ints indexing into the compound argument corresponding to the
+        parameter mentioned in the [0] tuple's element. If the final element addressed
+        by this is a compound, just like for a single string, it either refers to all
+        nested elements of the compound when possible, or errors out.
+        For example: a tuple `("Ptrs", 0, 1)` refers to `Ptrs` kernel signature
+        parameter, and expects a corresponding argument to be a tuple, with [0] being
+        another tuple, whose [1] element must be an array. If the [1]-th element is a
+        tuple, all it's components are addressed if possible, or errors out.
+    :in-spec: is an input array element specification in kernel's signature coordinate
+        system.
+    :out-spec: just like :in-spec:, only for output arrays. Coordinate space is the
+        same, just applies to output arrays.
+    In the context of `triton_call()` parameters:
+    - out_shape - as in the old convention, plus an ordered dict form mapping an
+      :out-spec: to a ShapeDtype object.
+    - out_names - is None or an ordered sequence of :out-spec: to be used in conjunction
+      with the `out_shape`. If `out_shape` is a dict, it must have the same keys as in
+      `out_names` in the same order. As a matter of optimization, we rely on the old
+      convention that the user is responsible for the correct order of the elements in
+      the out_names/out_shape sequences (i.e. we don't validate in `triton_call()` that
+      the order of elements in the `out_names` is exactly the same as in the kernel's
+      signature due to that being expensive).
+    - input_output_aliases - an extended old convention mapping :in-spec: to :out-spec:
+      in the kernel's signature coordinate space.
+    - zeroed_outputs - a similarly extended old convention for :out-spec:
 
   Returns:
     Outputs from the Triton kernel.
   """
+  jtfu = JTJITFunction(kernel)
+
+  def _canonicalize_in_spec_element(
+    self: JTJITFunction,
+    elm: int|str|tuple,
+    args: list[Any],
+    kwargs: dict[str, Any],
+    name2idx: dict[str, int],
+    idx2name: dict[int, str],
+  ) -> tuple[tuple[int, ...]]:
+    # this code runs each kernel launch, so proper validation is expensive here, so
+    # we skip most of checks allowing it just to fail, should the spec be incorrect.
+    # We might check some things later on the go.
+    orig_name = None
+    if isinstance(elm, int):
+      path = (elm,)
+    elif isinstance(elm, str):
+      orig_name = elm
+      path = (name2idx[elm],)  # user is responsible for correct indexing
+    elif isinstance(elm, tuple):
+      prim_idx = elm[0]
+      if isinstance(prim_idx, str):
+        orig_name = prim_idx
+        path = (name2idx[prim_idx], *elm[1:])
+      else:
+        path = elm
+    else:
+      raise ValueError(f"Invalid in_spec element: {elm}")
+    # checking if the path refers to a terminal array, or to a compound
+    prim_idx = path[0]
+    if prim_idx < len(args):  # must be in args by construction
+      arg = triton_runtime_jit.get_iterable_path(args, path)
+    else:   # must be in kwargs by construction
+      arg = triton_runtime_jit.get_iterable_path(
+        kwargs[idx2name[prim_idx] if orig_name is None else orig_name], path[1:]
+      )
+    if isinstance(arg, jax.Array):
+      return (path,)
+    # else it must be a tuple having arrays
+    tail = triton_runtime_jit.find_paths_if(arg, lambda _, x: isinstance(x, jax.Array))
+    if len(tail) == 0:
+      raise ValueError(f"Argument at in-spec '{elm}' ({path}) is not a jax.Array: {arg}")
+    return tuple((*path, *t) for t in tail)
+
+  def canonicalize_in_spec(
+    self: JTJITFunction, in_spec: Any, args: list[Any], kwargs: dict[str, Any]
+  ) -> tuple[tuple[int, ...]]:
+    name2idx = self.arg_name_to_index
+    idx2name = self.index_to_arg_name
+    if not isinstance(in_spec, (list, tuple)):
+      in_spec = (in_spec,)
+    return tuple(
+      itertools.chain.from_iterable(  # to flatten the top-level iterable
+        self._canonicalize_in_spec_element(elm, args, kwargs, name2idx, idx2name) for elm in in_spec
+      )
+    )
+
+  def _canonicalize_out_spec_element(
+    self: JTJITFunction,
+    elm: Any,
+    out_shapes: ShapeDtype | Sequence[ShapeDtype],
+    name2idx: dict[str, int],
+    idx2name: dict[int, str],
+  ) -> tuple[tuple[int, ...]]:
+    pass
+
+  def canonicalize_out_spec(
+    self: JTJITFunction, out_spec: Any, out_shapes: ShapeDtype | Sequence[ShapeDtype]
+  ) -> tuple[tuple[int, ...]]:
+    name2idx = self.arg_name_to_index
+    idx2name = self.index_to_arg_name
+    if not isinstance(out_spec, (list, tuple)):
+      out_spec = (out_spec,)
+    #return tuple(
+
+
+
   if input_output_aliases is None:
     input_output_aliases = {}
 
   if isinstance(out_names, str):
     out_names = (out_names,)
+  # a basic validation that should be evicted on compilation for jitting is fine
   if out_names is not None and not isinstance(out_names, tuple):
-    raise ValueError("out_names must be a tuple of strings or None")
+    raise ValueError("out_names must be None, a string, or a tuple of specific format")
 
   if isinstance(out_shape, dict):
+    # just validating coherence with out_names
     if out_names is None:
       out_names = tuple(out_shape.keys())
     else:
       if frozenset(out_names) != frozenset(out_shape.keys()):
         raise ValueError("out_names and out_shape must have the same keys")
     out_shape = tuple(out_shape.values())
-  # else we have to delay the check, or spend cycles on making an iterable
+  else:
+    # building out_shape dict if it's possible
+    if not isinstance(out_shape, (tuple, list)):
+      out_shape = (out_shape,)
+    if out_names is not None and len(out_names) != len(out_shape):
+      raise ValueError("out_shape and out_names must have the same length")
+
+  # TODO: order of elements in out_shape is important, as it determines ctx.avals_out.
+  # Essentially, translation from kernel argument coordinate space to array coordinate
+  # space is needed for: out_shape dict (it must be a dict form if possible),
+  # input_output_aliases and zeroed_outputs. The latter is the most annoying due to
+  # a callable form.
+
+  # TODO lowering must construct the same compounds as specified by out_shapes.
 
   out_shape = tree_util.tree_map(
     lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
   )
-  # TODO(sharadmv): check in_tree is flat (no Pytrees allowed in triton_call)
+
   flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
-  if out_names is not None and len(out_names) != len(flat_out_shapes):
-    raise ValueError("out_shape and out_names must have the same length")
 
   # Python guarantees the keys don't exist. The original Triton has a single namespace
   # for both constexprs and backend options, and we're doing the same to unify processing
@@ -1453,7 +1672,7 @@ def triton_call(
   kwargs["enable_fp_fusion"] = enable_fp_fusion
   kwargs["debug"] = debug
 
-  abs_args, abs_kwargs, args_kwargs_meta = serialize_args_kwargs(kernel, args, kwargs)
+  abs_args, abs_kwargs, args_kwargs_meta = serialize_args_kwargs(jtfu, args, kwargs)
 
   out_flat = triton_kernel_call_p.bind(
     *abs_args,
