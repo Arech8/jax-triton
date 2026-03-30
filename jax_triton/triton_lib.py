@@ -1167,6 +1167,10 @@ def triton_kernel_call_lowering(
     kernel_call = kernel_calls[0]
 
   call_proto = kernel_call.to_proto(kernel_call_name, serialized_metadata)
+  # TODO: operand_output_aliases parameter is a raw positional index into those operands
+  # that are seen by MLIR custom_call(). Scalars in JAX-Triton are embedded into
+  # `backend_config`/`call_proto` and aren't passed as MLIR operands, hence indices of
+  # `operand_output_aliases` count only arrays among all inputs.
   rule = jax.ffi.ffi_lowering(
     custom_call_target_name,
     api_version=2,
@@ -1341,6 +1345,9 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
     ),
   )
 """
+
+# TODO serializing kwargs as two sequences of keys+values seems to work way faster than
+# the current dictionary based implementation.
 
 # modified version to store all args as kwargs
 def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
@@ -1953,6 +1960,16 @@ def triton_call(
   Returns:
     Outputs from the Triton kernel.
   """
+  # the purpose of this function is to to call the Primitive's .bind() correctly. For
+  # this we need to:
+  # a. split arrays from everything else in args/kwargs
+  # b. preprocess a new (sequential) form of `input_output_aliases` to append shapes of
+  #   aliased buffers to `out_shapes` param, so a correct ctx.avals_out could be built.
+  #   Note that we should be able to reconstruct the structure of output-only args later
+  #   inside lowering to create correct Triton output arguments.
+  # c. input_output_aliases should eventually be turned into TODO
+
+
   # TODO(Arech) improve error reporting and check assumptions violation. We have a ton
   # of assumptions, requiring a certain behavior from a user. For most if not all of the
   # assumptions it's possible to verify them. We just don't do this b/c of performance
