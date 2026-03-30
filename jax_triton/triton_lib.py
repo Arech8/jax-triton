@@ -46,7 +46,7 @@ import numpy as np
 
 import triton
 from triton.compiler import compiler as tc
-import triton.language as tl
+# import triton.language as tl
 from triton.runtime import autotuner
 import triton.runtime.jit as triton_runtime_jit
 import triton._C.libtriton as _triton
@@ -54,7 +54,7 @@ import triton.backends.nvidia.compiler as cb
 import triton.backends.amd.compiler as hb
 
 import triton.experimental.gluon._runtime as gl_runtime
-from triton.experimental.gluon import language as gl
+# from triton.experimental.gluon import language as gl
 
 
 os.environ["TRITON_CACHE_DIR"] = ""
@@ -1045,7 +1045,7 @@ def triton_kernel_call_lowering(
   # after positional `args` passed to triton_call() there are N output args, from
   # which we can infer these arg names. That's an existing assumption too. Just need to
   # store the offset in the serializer.
-  # b. input_output_aliases should be name based, or we should otherwise prevent
+  #    b. input_output_aliases should be name based, or we should otherwise prevent
   # constructing output args for aliased buffers. A new form of input_output_aliases
   # would not even have output buffers at all, so that will simplify the construction.
   # Old form could be brought to the new one with validation (ensure out buffers are
@@ -1759,24 +1759,27 @@ def triton_call(
     kernel: A Triton (e.g. a function decorated with `triton.jit`) or a Gluon kernel.
       All static values should be annotated with `triton.language.constexpr` or
       `triton.experimental.gluon.language.constexpr`.
-    out_shape: (1) a single ShapeDtype-like object (something that has `.shape` and
-      `.dtype` attributes) corresponding to a single output parameter of the kernel;
+    out_shape: a description of shapes and dtypes of output parameters of the kernel.
+      Could be one of the following:
+      (1) a single ShapeDtype-like object (something that has `.shape` and
+      `.dtype` attributes) describing a single output parameter of the kernel;
       (2) an ordered, potentially nested, sequence of ShapeDtype-like objects
-      corresponding to multiple output parameters, where each top-level element of the
-      sequence corresponds to one output parameter (the nesting defines a form of an
+      corresponding to a one or many output parameters, where each root-level element of
+      the sequence describes one output parameter (the nesting defines a form of the
       individual argument, for example, `out_shape=((a,b),c)` defines two output
       arguments, the first is a tuple of arrays having shapes and dtypes of arrays a
-      and b, and the second is an array having shape and dtype of array c; hence the
-      kernel must have 2 output parameters, the first is a tuple of 2 arrays and the
-      second is a single array); or
+      and b, and the second is an array having shape and dtype of array c); or
       (3) a dictionary mapping kernel's output parameter names or indices to one
       ShapeDtype-like object or an ordered, potentially nested, sequence of such
       objects. Order of the dictionary elements isn't important and is reconstructed
-      from the kernel's signature, but order and nested structure of elements in
-      sequences in the dictionary values is important and defines the structure of the
+      from the kernel's signature, but the order and the nested structure of elements in
+      sequences of the dictionary values is important and defines the structure of the
       output argument. For example, `out_shape={"a": (x,y), "b": z}` defines that the
       kernel has two output parameters: param named as "a" is a tuple of 2 arrays
-      borrowing their shapes and dtypes from arrays x and y, and "b" is a single array.
+      borrowing their shapes and dtypes from arrays x and y, and "b" is a single
+      `z`-like array. Dictionary form doesn't benefit from specifying `out_names`, but
+      might be more readable and less error-prone due to binding arguments directly to
+      parameter names.
 
       Contrary to the Triton itself, JAX/XLA must manage memory buffers and organize
       data copying between host and device memory for all array parameters, so
@@ -1793,45 +1796,76 @@ def triton_call(
       an assumption that output parameters follow the positional parameter values passed
       as `args` to `triton_call()`.
       Note that no matter which form of `out_shape` is used, arguments corresponding to
-      strictly output parameters should never be passed to a `triton_call()`, - these
-      arguments are added implicitly by the launcher. If an argument is going to be an
-      input-output argument, set `input_output_aliases` accordingly.
-    out_names: set of output parameter names. Ordering is determined by the signature.
-      This is another way
-      to specify the output parameter names of the kernel. This one is useful to employ
-      in conjunction with the @kernel decorator when outputs doesn't depend on argument
-      values, and adds a layer of argument order verification, since the decorator could
-      check the order conformance at least on the top level.
-      If `out_shape` is a dictionary, `out_names` must have the same keys.
+      strictly output parameters should never be passed to a `triton_call()` as a part
+      of `args` or `kwargs`, - these arguments are added implicitly by the launcher. If
+      an argument is going to be an input-output argument, set `input_output_aliases`
+      accordingly.
+    out_names: a set of output parameter names. Ordering is determined by the signature.
+      This is another way to specify the output parameter names of the kernel. This one
+      is useful to employ in conjunction with the @kernel decorator.
+      If `out_shape` is a dictionary, its keys must be in sync with `out_names`.
     grid: An integer, tuple of up to 3 integers, or a function that returns a
       tuple of up to 3 integers. When `grid` is an integer, `kernel` is
       invocated in `grid`-many parallel executions. When `grid` is a sequence of
       integers, `kernel` is launched in a `prod(grid)`-many parallel execution.
       When `grid` is a function, it is passed `**kwargs` and should return a
       tuple of up to 3 integers.
-    input_output_aliases: A dictionary mapping input argument indices in `args`
-      to output argument indices, to alias the corresponding buffers.
-      Important: if purely output arguments are also used, they must go first in
-      `out_shape`, and aliased buffers must go last in the sequence. Interleaving output
-      with in/out argument shapes in `out_shape` isn't supported. User is responsible
-      for adhering to the requirement.
-      TODO: a sequence of potentially nested tuples of :in-spec: is enough. Typecasting
-      for aliased buffers isn't supported by JAX/XLA, so shapes and dtypes of buffers
-      aren't needed in `out_shape` and should be taken from inputs instead directly.
-      The output buffers for aliases should be added automatically after the purely
-      output buffers. Triton don't need these buffers as variables, but the order and
-      nested structure of elements in the sequence determine structure of resulting
-      elements returned by triton_call(), i.e. defines a nested composition of returned
-      to the user aliases.
-    zeroed_outputs: A sequence of output indices, or a function returning a sequence of
-      such indices, for outputs that should be zeroed before the kernel is launched.
-      BREAKING: This argument does NOT support zeroing input-output (i.e. aliased through
-      `input_output_aliases`) arguments anymore. Zeroing of an input-output argument
-      turns it into simply output argument. Note the terminological mess here: inputs-
-      outputs are taken from XLA's perspective, whose job is to manage memory buffers
-      and arrange data copying between host and device memory for all array parameters.
-      A kernel could read from what is called a purely output argument here.
-
+    input_output_aliases: tells JAX/XLA backend which input arguments not only supply
+      input data to the kernel, but also serve as output buffers (hence requiring the
+      backend to arrange not only `host->device` data copying before kernel launch, but
+      also `device->host` data copying after kernel execution). Might take two forms:
+      (1 - deprecated): A dictionary mapping an input array coordinate in the kernel's
+      signature coordinate space to the `out_shape` sequence coordinate space.
+      Important note: if the kernel also has purely output arguments, they must go first
+      in the `out_shape` sequence, and aliased buffers must go last in the sequence.
+      Interleaving output with in/out argument shapes in `out_shape` isn't supported.
+      User is responsible for adhering to the requirement.
+      (2 - recommended): a non-dictionary form expands to an ordered, potentially
+      nested, sequence of input array coordinates in the kernel's signature coordinate
+      space. This form requires to NOT having corresponding output arguments in the
+      `out_shape`. Shapes and dtypes are inferred from referenced input arguments
+      automatically (JAX/XLA doesn't support typecasting of aliased buffers anyway, so
+      `out_shape` for aliased buffers is redundant). This could be specifically:
+      - a single int, or a string, or a tuple having an int or a string as a first
+        element: describes an input array in the kernel's signature coordinate space.
+      - a list: ordered, possibly nested, sequence of the above. The nested structure of
+        the sequence describes the structure of the corresponding output argument,
+        containing aliased buffers as it's returned by the `triton_call()`. For example,
+        `input_output_aliases=["out_ptr",[(2,0), "out_ptr2"]]` describes three aliased
+        (input-output) buffers: the first is an input array passed for `out_ptr` kernel
+        parameter, the second is an array passed at index 0 of a tuple passed to the
+        third positional parameter, and the third is an input array passed for
+        `out_ptr2` kernel parameter. These three buffers are returned from
+        `triton_call()` as a tuple of two elements: [0] is a new array wrapping around
+        the same buffer as was used for `out_ptr` kernel parameter, and [1] is a tuple
+        of two new arrays wrapping the other two array buffers.
+        Note that tuples can also be used instead of lists, just remember that if a
+        tuple's first element is not another iterable, it's always treated as a
+        coordinate descriptor, which might be not what you want. For example,
+        `input_output_aliases=(0,1)` is always treated as a reference to an array at
+        the second position of a tuple passed to the first kernel parameter, but
+        `input_output_aliases=[0,1]` references two arrays passed to the first and the
+        second kernel parameters respectively. Hence for clarity it's recommended,
+        to use tuples only when describing a single input array coordinate.
+      Note that if a kernel needs to start working with an initially zeroed read-write
+      buffer that should be returned as an output (for example, for doing sparse
+      updates), you should designate a purely output argument for it with a proper
+      `out_shape` specification, and mention the buffer coordinate in `out_shape` in
+      `zeroed_outputs` parameter.
+    zeroed_outputs: A sequence of `out_shape` coordinates, or a function returning a
+      sequence of such coordinates, for outputs that should be zeroed before the kernel
+      is launched.
+      BREAKING: This argument does NOT support zeroing input-output (i.e. aliased
+      through `input_output_aliases`) arguments anymore since this breaks the semantic
+      of the input-output parameters - with that you can't pass an information in the
+      buffer from the host to the kernel, effectively turning an input-output argument
+      into a purely output argument. Mind a little of terminological mess here:
+      inputs-outputs are considered from the backend's perspective, whose job
+      is to manage memory buffers and arrange data copying between host and device
+      memory for all array parameters. A kernel could always read from what is called a
+      purely output argument above, so if you need the kernel to start working with a
+      buffer from a definite zeroed state, just declare the buffer as a purely output
+      argument in `out_shape` and mention the buffer's coordinate in `zeroed_outputs`.
     num_warps: The number of warps used to execute the Triton kernel.
     num_stages: The number of stages emitted by the Triton compiler.
     num_ctas: The size of thread blocks per cluster to be used on GPUs with
@@ -1846,8 +1880,7 @@ def triton_call(
       - a `grid` (if it is a function),
       - backend options constructor (only recognized arguments are passed),
       - the Triton kernel as `constexpr` arguments (constexprs must always be scalars)
-        or regular runtime arguments (scalars only; arrays must be passed as positional
-        arguments) (only recognized as kernel parameters are passed).
+        or regular runtime arguments.
 
     Default values in kernel signature are supported only for scalars, or for output
     arguments (for outputs only the value of None is allowed as a default - this is
