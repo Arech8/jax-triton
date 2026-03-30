@@ -1346,12 +1346,10 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   )
 """
 
-# TODO serializing kwargs as two sequences of keys+values seems to work way faster than
-# the current dictionary based implementation.
-
 # modified version to store all args as kwargs
+"""
 def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
-  """Prepares args and kwargs for passing through JAX's primitive system by separating
+  " ""Prepares args and kwargs for passing through JAX's primitive system by separating
   things that must be traced from things that must be passed as is.
 
   Returns two sequences of traced values and a tuple of hashable reconstruction info.
@@ -1359,7 +1357,7 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   special checks for hashability are done for performance reasons.
 
   Note that the function consumes kwargs, i.e. its state is modified in place.
-  """
+  "" "
   assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
   # JAX's Primitive.bind(*args, **params) has a strict dichotomy:
   # - *args (positional) are dynamic operands — values that participate in JAX's
@@ -1397,6 +1395,102 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   abs_args = {}
   # static_args = (to_python_type(v) for v in flat_args if not isinstance(v, jax.Array))
   static_args = tuple()
+  # we're going to pass flat_args as static params now. There's a caveat at least for
+  # tl.constexpr() objects: JAX's lowering code seems to require only hashability
+  # and correct equality semantics for static objects, and this is true for
+  # tl.constexpr() with a nuance: on comparison it returns not a bool True/False, but
+  # another tl.constexpr() object with a bool value. So if there's a silly check in JAX
+  # that the `(a==b) is True`, or `type(a==b) is bool` - it'll break.
+
+  # Now do the same for kwargs with a caveat - we must traverse them in order of kernel
+  # parameters declaration to ensure arrays ends up in a correct order
+  def contain_arrays(v):
+    if isinstance(v, jax.Array):
+      return True
+    elif isinstance(v, tuple):  # among pytrees only tuples could be passed as arguments
+      return any(contain_arrays(x) for x in v)
+    return False
+
+  class _FakeVal: ...
+
+  abs_kwargs_list = []  # only values to abstract
+  abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
+  for aname in jtfu.arg_names:
+    # if kwargs has that parameter AND the value contains an array somewhere (including
+    # nested tuples/lists), we handle the whole arg value differently to be able to
+    # reconstruct it correctly. Otherwise we just skip the arg to pass it along with
+    # other kwargs, such as backend options.
+    arg_val = kwargs.get(aname, _FakeVal())
+    if contain_arrays(arg_val):
+      del kwargs[aname]  # handle the value differently
+      if isinstance(arg_val, jax.Array):  # shortcutting if the value is a raw array
+        abs_kwargs_list.append(arg_val)
+        abs_kwargs_meta[aname] = None
+      else:  # do full flattening
+        flat_v, the_tree = tree_util.tree_flatten(arg_val)
+        abs_v = {i: v for i, v in enumerate(flat_v) if isinstance(v, jax.Array)}
+        static_v = (to_python_type(v) for v in flat_v if not isinstance(v, jax.Array))
+        abs_kwargs_list.extend(abs_v.values())
+        abs_kwargs_meta[aname] = (tuple(static_v), tuple(abs_v.keys()), the_tree)
+
+  return (
+    abs_args.values(),  # intentionally not materialized
+    abs_kwargs_list,
+    (  # first go args info
+      args_tree,
+      tuple(abs_args.keys()),
+      tuple(static_args),
+      # then kwargs info
+      tuple(abs_kwargs_meta.items()),
+      to_hashable_metaparams(kwargs),
+    ),
+  )
+"""
+
+# TODO serializing kwargs as two sequences of keys+values seems to work way faster than
+# the current dictionary based implementation.
+def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
+  """Prepares args and kwargs for passing through JAX's primitive system by separating
+  things that must be traced from things that must be passed as is.
+
+  Returns two sequences of traced values and a tuple of hashable reconstruction info.
+  Assumes that a caller adheres to the Triton's rules about argument types, so no
+  special checks for hashability are done for performance reasons.
+
+  Note that the function consumes kwargs, i.e. its state is modified in place.
+  """
+  assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
+  # JAX's Primitive.bind(*args, **params) has a strict dichotomy:
+  # - *args (positional) are dynamic operands — values that participate in JAX's
+  # tracing/transformation system (jit, grad, vmap). During JIT compilation, they become
+  # abstract values (ShapedArray) and then MLIR SSA values in the lowered IR.
+  # - **params (keyword) are static parameters — they must be hashable, are passed
+  # through verbatim, and retain their concrete Python values across the entire
+  # compilation pipeline.
+  # Hence to pass data through JAX's primitive system we must separate things that must
+  # be traced from things that must be passed as is. The restriction is that since JAX
+  # arrays must be managed by XLA, they must be passed as traced items. The rest could
+  # go concrete helping to specialize the kernel properly.
+  # We must implement the separation in a way that (1) allows to reconstruct both `args`
+  # and `kwargs` back exactly on the other end to process them properly, and (2) all JAX
+  # array arguments go into .bind() call in exactly the same order as the kernel expects
+  # them (so we don't have to reshuffle them later during the lowering). In that we
+  # assume that no JAX array could be specialized to a constexpr for compiling, which
+  # holds in the upstream Triton too (small arrays could be passed as tuples/lists
+  # though to constexpr annotated params).
+
+  flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
+  # We must let Nones to pass through flattening and `is_leaf` semantic is additive.
+
+  # Since there's usually much more non-vector parameters than vectors, extracting
+  # vectors from flat_args. Jax explicitly guarantee that `isinstance(x, jnp.ndarray)`
+  # check behaves correctly for raw arrays as well as for tracers. For jitting all/most
+  # of Python scalars are mapped to ShapedArray avals too, so they are treated as arrays
+  # by the check. However, there's no use-case where we might want to pass a scalar as a
+  # traceable thing into the kernel call, so we can safely assume a user will mark it as
+  # a static argument for jitting (the old implementation relied on that too).
+  abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
+  static_args = (to_python_type(v) for v in flat_args if not isinstance(v, jax.Array))
   # we're going to pass flat_args as static params now. There's a caveat at least for
   # tl.constexpr() objects: JAX's lowering code seems to require only hashability
   # and correct equality semantics for static objects, and this is true for
@@ -1574,11 +1668,16 @@ def _canonicalize_out_spec_element(
       orig_name = prim_idx
       path = (name2idx[prim_idx], *elm[1:])
     else:
+      if not isinstance(prim_idx, str):
+        raise ValueError(f"Invalid first element of this out-spec: {elm}")
       path = elm
   else:
     raise ValueError(f"Invalid in_spec element: {elm}")
   # checking that a nested path refers to a ShapeDtypeStruct; If it's a compound -
   # enhance the path to address all its elements.
+  # TODO: how do we use the output element paths? Can we shortcut here and only store
+  # a path to the relevant highest-level element of the signature?
+
   arg = triton_runtime_jit.get_iterable_path(out_shapes, (elm_idx, *path[1:]))
   if isinstance(arg, jax.ShapeDtypeStruct):
     return (path,)
@@ -1598,6 +1697,7 @@ def _canonicalize_out_spec_element(
   return tuple((*path, *t) for t in tail)
 
 
+# TODO: is the function needed?
 def canonicalize_out_spec(
   jtfu: JTJITFunction, out_spec: InOutSpec, out_shapes: Sequence[jax.ShapeDtypeStruct]
 ) -> CanonicalKernelArgPaths:
@@ -1624,14 +1724,62 @@ def canonicalize_input_output_aliases(
   # TODO IMPLEMENT
 
 
+def _split_out_values(
+  out_values: tuple,
+  out_names: None | InOutSpec,
+  input_output_aliases: dict[int, int] | Sequence[InOutSpec],
+) -> tuple[tuple, tuple]:
+  """Splits `out_values` into a tuple of purely output values and a tuple of aliased
+  values."""
+  # If we know `out_names`, the first len(out_names) elements in `out_values`
+  # must describe pure outputs. Else if there's a dict form of `input_output_aliases`,
+  # then len(input_output_aliases) is the number of aliased buffers/shapes. Else -
+  # there are no aliased elements.
+  if out_names is not None:
+    num_purely_output = len(out_names)
+    num_aliased = len(out_values) - num_purely_output
+    if num_aliased < 0 or (
+      isinstance(input_output_aliases, dict)
+      and num_aliased != len(input_output_aliases)
+    ):
+      raise ValueError(
+        "Content of `out_shape` doesn't match to `out_names` and `input_output_aliases` specification"
+      )
+  elif isinstance(input_output_aliases, dict):
+    num_aliased = len(input_output_aliases)
+    num_purely_output = len(out_values) - num_aliased
+    if num_purely_output < 0:
+      raise ValueError(
+        "There was specified more aliased buffers than there are output arguments"
+      )
+  else:
+    num_aliased = 0
+    num_purely_output = len(out_values)
+
+  if num_aliased > 0:
+    aliased_shapes = out_values[num_purely_output:]
+    out_values = out_values[:num_purely_output]
+  else:
+    aliased_shapes = ()
+  return out_values, aliased_shapes
+
+
 def canonicalize_out_shape(
   jtfu: JTJITFunction,
   out_shape: ShapeDtype | Sequence[ShapeDtype] | dict[InOutSpec, Sequence[ShapeDtype]],
   out_names: None | InOutSpec,
-  args: list[Any],
-) -> dict[CanonicalKernelArgPaths, Sequence[jax.ShapeDtypeStruct]]:
+  args: list[Any],  # positional args passed to the launcher
+  input_output_aliases: dict[int, int] | Sequence[InOutSpec],  # original aliases
+) -> tuple[
+  dict[CanonicalKernelArgPaths, Sequence[jax.ShapeDtypeStruct]],
+  Sequence[jax.ShapeDtypeStruct],
+]:
   """Converts different forms of out_shape and out_names to a single dict mapping from
-  output kernel argument paths to shapes/dtypes of the output arguments."""
+  output kernel argument paths to shapes/dtypes of the output arguments for output-only
+  arguments (those have corresponding parameters in the kernel's signature), and a
+  sequence of shapes/dtypes of aliased arguments (those don't have corresponding
+  parameters in the kernel's signature).
+  """
   if isinstance(out_names, str):
     out_names = (out_names,)
   # a basic validation that should be evicted on compilation for jitting is fine
@@ -1640,36 +1788,41 @@ def canonicalize_out_shape(
       "out_names must be None, a string, or a tuple/list of specific format"
     )
 
-  # TODO: out_values also contain shapes of aliased buffers and these don't have
-  # output params in the kernel's signature! Neither names for these arguments should be
-  # specified.
-
   if isinstance(out_shape, dict):
+    # dictionary form doesn't have info on aliased buffers
     if out_names is None:
       out_names = tuple(out_shape.keys())
-      out_values = out_shape.values()
     else:
+      # TODO: remove the check to speedup things/check only lengths, or add cache!
       if frozenset(out_names) != frozenset(out_shape.keys()):
         raise ValueError("out_names and out_shape must have the same keys")
-      # `out_names` ordering takes precedence over `out_shape` dict ordering.
-      out_values = (out_shape[k] for k in out_names)
+    out_values = out_shape.values()
+    aliased_shapes = ()
   else:
     if isinstance(out_shape, list):
       out_shape = tuple(out_shape)
     out_values = out_shape if isinstance(out_shape, tuple) else (out_shape,)
-  # no use of out_shape below this line
-
-  out_values = tree_util.tree_map(
-    lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_values
-  )
-  if out_names is None:
-    # building out_names from the assumption that `args` contain all input arguments
-    arg_names = jtfu.arg_names
-    # out_values may contain compounds, hence we must consider non-flattened shapes
-    out_names = tuple(arg_names[i + len(args)] for i in range(len(out_values)))
-  else:
+    # out_values here might contain shapes for aliased elements, we need to split them
+    out_values, aliased_shapes = _split_out_values(
+      out_values, out_names, input_output_aliases
+    )
+    # TODO we could perhaps even drop `aliased_shapes` entirely, as we reconstruct them
+    # from the signature
+    if out_names is None:
+      # building out_names from the assumption that `args` contain all input arguments
+      arg_names = jtfu.arg_names
+      # out_values may contain compounds, hence we must consider non-flattened shapes
+      out_names = tuple(arg_names[i + len(args)] for i in range(len(out_values)))
     if len(out_names) != len(out_values):  # this checks only top level specs
       raise ValueError("out_shape specification mismatches out_names")
+  # no use of out_shape below this line
+
+  def _to_shape_dtype_struct(a: Any) -> jax.ShapeDtypeStruct:
+    return jax.ShapeDtypeStruct(a.shape, a.dtype)
+
+  if aliased_shapes:
+    aliased_shapes = tree_util.tree_map(_to_shape_dtype_struct, aliased_shapes)
+  out_values = tree_util.tree_map(_to_shape_dtype_struct, out_values)
 
   # now finally canonicalizing out_names using the out_values. Since
   # canonicalize_out_spec() flattens the spec, we must do it step by step
@@ -1678,7 +1831,7 @@ def canonicalize_out_shape(
   for i, outn in enumerate(out_names):
     ospec = _canonicalize_out_spec_element(outn, i, out_values, name2idx)
     out_shape[ospec] = out_values[i]
-  return out_shape
+  return out_shape, aliased_shapes
 
 
 def triton_call(
@@ -1769,14 +1922,14 @@ def triton_call(
     out_shape: a description of shapes and dtypes of output parameters of the kernel.
       Could be one of the following:
       (1) a single ShapeDtype-like object (something that has `.shape` and
-      `.dtype` attributes) describing a single output parameter of the kernel;
-      (2) an ordered, potentially nested, sequence of ShapeDtype-like objects
+      `.dtype` attributes) describing a single output parameter of the kernel; or an
+      ordered, potentially nested, sequence of ShapeDtype-like objects
       corresponding to a one or many output parameters, where each root-level element of
       the sequence describes one output parameter (the nesting defines a form of the
       individual argument, for example, `out_shape=((a,b),c)` defines two output
       arguments, the first is a tuple of arrays having shapes and dtypes of arrays a
       and b, and the second is an array having shape and dtype of array c); or
-      (3) a dictionary mapping kernel's output parameter names or indices to one
+      (2) a dictionary mapping kernel's output parameter names or indices to one
       ShapeDtype-like object or an ordered, potentially nested, sequence of such
       objects. Order of the dictionary elements isn't important and is reconstructed
       from the kernel's signature, but the order and the nested structure of elements in
@@ -1784,9 +1937,11 @@ def triton_call(
       output argument. For example, `out_shape={"a": (x,y), "b": z}` defines that the
       kernel has two output parameters: param named as "a" is a tuple of 2 arrays
       borrowing their shapes and dtypes from arrays x and y, and "b" is a single
-      `z`-like array. Dictionary form doesn't benefit from specifying `out_names`, but
-      might be more readable and less error-prone due to binding arguments directly to
-      parameter names.
+      `z`-like array. The dictionary form doesn't benefit from specifying `out_names`,
+      but might be more readable and less error-prone due to binding arguments directly
+      to parameter names. Note that if a dictionary form of `out_shape` is used,
+      `input_output_aliases`, if they are needed, could only use a non-dictionary form
+      enumerating input arrays only.
 
       Contrary to the Triton itself, JAX/XLA must manage memory buffers and organize
       data copying between host and device memory for all array parameters, so
@@ -1967,8 +2122,14 @@ def triton_call(
   #   aliased buffers to `out_shapes` param, so a correct ctx.avals_out could be built.
   #   Note that we should be able to reconstruct the structure of output-only args later
   #   inside lowering to create correct Triton output arguments.
-  # c. input_output_aliases should eventually be turned into TODO
-
+  # c. For that, `out_shape` must already be in some non-ambiguous form, i.e. dict
+  #   out_name->descr + tuple of non-matching elements if there were any
+  # d. input_output_aliases should eventually be turned into a mapping int->int counting
+  #   arrays only, but that might be doable later after the .bind().
+  jtfu = JTJITFunction(kernel)
+  purely_output_shapes, aliased_shapes = canonicalize_out_shape(
+    jtfu, out_shape, out_names, args, input_output_aliases
+  )
 
   # TODO(Arech) improve error reporting and check assumptions violation. We have a ton
   # of assumptions, requiring a certain behavior from a user. For most if not all of the
@@ -1980,7 +2141,7 @@ def triton_call(
   # with the uncached run and all subsequent runs will be blazingly fast. (2) we already
   # have a `debug` parameter that is meant precisely for that.
 
-  jtfu = JTJITFunction(kernel)
+  
 
   if input_output_aliases is None:
     input_output_aliases = {}
