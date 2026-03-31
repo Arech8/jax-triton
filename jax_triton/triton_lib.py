@@ -72,7 +72,7 @@ GridOrLambda = Union[Grid, Callable[[dict[str, Any]], Grid]]
 # parameters are)
 # Triton calls a coordinate a path, so have to follow
 CanonicalKernelArgPath = tuple[int, ...]
-CanonicalKernelArgPaths = tuple[CanonicalKernelArgPath, ...]
+# CanonicalKernelArgPaths = tuple[CanonicalKernelArgPath, ...]
 KernelArgPath = tuple[int | str, *tuple[int, ...]]
 InOutSpec = int | str | tuple[int | str | KernelArgPath, ...]
 
@@ -1015,7 +1015,8 @@ def triton_kernel_call_lowering(
   out_shapes,
   grid,
   compute_capability,
-  input_output_aliases,
+  # input_output_aliases,
+  operand_output_aliases,
   zeroed_outputs,
   serialized_metadata,
   args_kwargs,
@@ -1028,8 +1029,9 @@ def triton_kernel_call_lowering(
   #   with input_output_aliases.
   # 2. providing additional buffers to zero when JAX's launcher is called.
   # 3. provide a raw index mapping from inputs to outputs for the backend
-  assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
-  input_output_aliases = dict[int, int](input_output_aliases)
+  #assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
+  #input_output_aliases = dict[int, int](input_output_aliases)
+  operand_output_aliases = dict[int, int](operand_output_aliases)
 
   out_spec, out_tree = out_info
   assert out_spec is None or (
@@ -1155,7 +1157,7 @@ def triton_kernel_call_lowering(
 
     input_output_aliases_with_sizes = tuple(
       (input_idx, output_idx, aval_size_bytes(ctx.avals_in[input_idx]))
-      for input_idx, output_idx in input_output_aliases.items()
+      for input_idx, output_idx in operand_output_aliases.items()
     )
     kernel_call = triton_kernel_call_lib.TritonAutotunedKernelCall(
       # f"{kernel_call_name} ({fn.fn.__name__}) {named_scalar_args}",
@@ -1175,7 +1177,7 @@ def triton_kernel_call_lowering(
     custom_call_target_name,
     api_version=2,
     backend_config=zlib.compress(call_proto),
-    operand_output_aliases=input_output_aliases,
+    operand_output_aliases=operand_output_aliases,
   )
   return rule(ctx, *abstract_args)
 
@@ -1447,8 +1449,6 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   )
 """
 
-# TODO serializing kwargs as two sequences of keys+values seems to work way faster than
-# the current dictionary based implementation.
 def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   """Prepares args and kwargs for passing through JAX's primitive system by separating
   things that must be traced from things that must be passed as is.
@@ -1482,7 +1482,7 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
   # We must let Nones to pass through flattening and `is_leaf` semantic is additive.
 
-  # Since there's usually much more non-vector parameters than vectors, extracting
+  # Since there's usually much more non-vector parameters than vectors, extract
   # vectors from flat_args. Jax explicitly guarantee that `isinstance(x, jnp.ndarray)`
   # check behaves correctly for raw arrays as well as for tracers. For jitting all/most
   # of Python scalars are mapped to ShapedArray avals too, so they are treated as arrays
@@ -1490,6 +1490,11 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   # traceable thing into the kernel call, so we can safely assume a user will mark it as
   # a static argument for jitting (the old implementation relied on that too).
   abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
+  # counting raw arrays to build `operand_output_aliases` mapping
+  array_id2idx = {id(v):idx for idx, v in enumerate(abs_args.values())}
+  # Note that we assume user won't pass the same array several times in args or in
+  # kwargs AND would want to alias it, so not checking this here and below
+
   static_args = (to_python_type(v) for v in flat_args if not isinstance(v, jax.Array))
   # we're going to pass flat_args as static params now. There's a caveat at least for
   # tl.constexpr() objects: JAX's lowering code seems to require only hashability
@@ -1511,6 +1516,8 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
 
   abs_kwargs_list = []  # only values to abstract
   abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
+  idx_offset = len(array_id2idx)
+  # iterating over param names ensures correct serialization ordering
   for aname in jtfu.arg_names:
     # if kwargs has that parameter AND the value contains an array somewhere (including
     # nested tuples/lists), we handle the whole arg value differently to be able to
@@ -1525,6 +1532,10 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
       else:  # do full flattening
         flat_v, the_tree = tree_util.tree_flatten(arg_val)
         abs_v = {i: v for i, v in enumerate(flat_v) if isinstance(v, jax.Array)}
+        array_id2idx.update(
+          (id(v), idx + idx_offset) for idx, v in enumerate(abs_v.values())
+        )
+        idx_offset += len(abs_v)
         static_v = (to_python_type(v) for v in flat_v if not isinstance(v, jax.Array))
         abs_kwargs_list.extend(abs_v.values())
         abs_kwargs_meta[aname] = (tuple(static_v), tuple(abs_v.keys()), the_tree)
@@ -1532,13 +1543,15 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   return (
     abs_args.values(),  # intentionally not materialized
     abs_kwargs_list,
+    array_id2idx,  # array id -> flat array index mapping
+    idx_offset,  # total number of input arrays
     (  # first go args info
-      args_tree,
-      tuple(abs_args.keys()),
-      tuple(static_args),
+      args_tree,  # structure of args
+      tuple(abs_args.keys()),  # array positions in args
+      tuple(static_args),  # leftover after arrays removed
       # then kwargs info
       tuple(abs_kwargs_meta.items()),
-      to_hashable_metaparams(kwargs),
+      to_hashable_metaparams(kwargs),  # leftover kwargs
     ),
   )
 
@@ -1728,13 +1741,13 @@ def make_aliased_shapes(
   orig_aliased_shapes: Sequence[jax.ShapeDtypeStruct],
   args: list[Any],
   kwargs: dict[str, Any],
-) -> tuple[tuple[jax.ShapeDtypeStruct], dict[ArrayId, OutShapeId]]:
+) -> tuple[list[jax.ShapeDtypeStruct], dict[ArrayId, OutShapeId]]:
   """Uses `input_output_aliases` to produce a tuple of aliased shapes to append to
   `out_shapes` for the Primitive's .bind() call, and a dict mapping input array
   identifiers to output array identifiers. After serialization, we'll be able to
   create `operand_output_aliases` dictionary based on raw array indices using this
   mapping."""
-
+  assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
   # building aliased_shapes from in_spec
   is_dict = isinstance(input_output_aliases, dict)
   in_spec = list(input_output_aliases.keys()) if is_dict else input_output_aliases
@@ -1763,8 +1776,6 @@ def make_aliased_shapes(
     return shapes
 
   aliased_shapes = _impl(in_spec)
-  if isinstance(aliased_shapes, list):
-    aliased_shapes = tuple(aliased_shapes)
 
   # TODO perhaps remove it to spare cycles?
   # if it's a dict, validating that out_shapes match to aliased_shapes
@@ -1785,10 +1796,10 @@ def make_aliased_shapes(
 
 
 def _split_out_values(
-  out_values: tuple,
+  out_values: Sequence,
   out_names: None | InOutSpec,
   input_output_aliases: dict[int, int] | Sequence[InOutSpec],
-) -> tuple[tuple, tuple]:
+) -> tuple[tuple, Sequence]:
   """Splits `out_values` into a tuple of purely output values and a tuple of aliased
   values."""
   # If we know `out_names`, the first len(out_names) elements in `out_values`
@@ -1820,7 +1831,7 @@ def _split_out_values(
     aliased_shapes = out_values[num_purely_output:]
     out_values = out_values[:num_purely_output]
   else:
-    aliased_shapes = ()
+    aliased_shapes = []
   return out_values, aliased_shapes
 
 
@@ -1840,6 +1851,7 @@ def canonicalize_out_shape(
   sequence of shapes/dtypes of aliased arguments (those don't have corresponding
   parameters in the kernel's signature).
   """
+  assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
   if isinstance(out_names, str):
     out_names = (out_names,)
   # a basic validation that should be evicted on compilation for jitting is fine
@@ -1857,7 +1869,7 @@ def canonicalize_out_shape(
       if frozenset(out_names) != frozenset(out_shape.keys()):
         raise ValueError("out_names and out_shape must have the same keys")
     out_values = out_shape.values()
-    aliased_shapes = ()
+    aliased_shapes = []
 
     # TODO(Arech): if we sort out_names here in the kernel's signature order, we could
     # drop the requirement for out_names/out_shape(as dict) to be sorted. This would
@@ -1890,7 +1902,7 @@ def canonicalize_out_shape(
   out_values = tree_util.tree_map(_to_ShapeDtypeStruct, out_values)
 
   # now finally canonicalizing out_names using the out_values.
-  pure_out_shapes: dict[CanonicalKernelArgPaths, Sequence[jax.ShapeDtypeStruct]] = {}
+  pure_out_shapes: dict[CanonicalKernelArgPath, Sequence[jax.ShapeDtypeStruct]] = {}
   name2idx = jtfu.arg_name_to_index
   for i, outn in enumerate(out_names):
     # ospec = _canonicalize_out_spec_element(outn, i, out_values, name2idx)
@@ -1977,6 +1989,24 @@ def canonicalize_out_spec(
     )
   )
 """
+
+
+# TODO remove?
+def make_out_shapes(
+    pure_out_shapes: dict[CanonicalKernelArgPath, Sequence[jax.ShapeDtypeStruct]],
+    aliased_shapes: list[jax.ShapeDtypeStruct],
+    aliases: dict[ArrayId, OutShapeId],
+    array_id2idx: dict[ArrayId, int],
+    idx_offset: int,
+    ) -> tuple[tuple, tree_util.PyTreeDef, tree_util.PyTreeDef, dict[int, int]]:
+    """Returns:
+    - combined output+aliased arguments flat shapes as a tuple,
+    - their tree structure as a PyTreeDef,
+    - purely output arguments tree structure as a PyTreeDef,
+    - operand_output_aliases mapping."""
+    pass
+
+
 
 
 def triton_call(
@@ -2263,42 +2293,6 @@ def triton_call(
   Returns:
     Outputs from the Triton kernel.
   """
-  # the purpose of this function is to to call the Primitive's .bind() correctly. For
-  # this we need to:
-  # a. split arrays from everything else in args/kwargs
-  # b. preprocess a new (sequential) form of `input_output_aliases` to append shapes of
-  #   aliased buffers to `out_shapes` param, so a correct ctx.avals_out could be built.
-  #   Note that we should be able to reconstruct the structure of output-only args later
-  #   inside lowering to create correct Triton output arguments.
-  # c. For that, `out_shape` must already be in some non-ambiguous form, i.e. dict
-  #   out_name->descr + tuple of non-matching elements if there were any
-  # d. input_output_aliases should eventually be turned into a mapping int->int counting
-  #   arrays only, but that might be doable later after the .bind().
-
-  # Python guarantees the keys don't exist. The original Triton has a single namespace
-  # for both constexprs and backend options, and we're doing the same to unify processing
-  # We are setting defaults here early, since we use values early
-  kwargs["num_warps"] = num_warps if num_warps is not None else 4
-  kwargs["num_stages"] = num_stages if num_stages is not None else 3
-  kwargs["num_ctas"] = num_ctas
-  kwargs["enable_fp_fusion"] = enable_fp_fusion
-  kwargs["debug"] = debug
-
-  jtfu = JTJITFunction(kernel)
-  pure_out_shapes, aliased_shapes = canonicalize_out_shape(
-    jtfu, out_shape, out_names, args, input_output_aliases
-  )
-  # now structure of `pure_out_shapes` would let us reconstruct the output variables
-  # for Triton using ctx.avals_out instead of arrays, and the dict keys would let us
-  # place them correctly into args/kwargs. And also to properly structure returned
-  # outputs from the call
-  aliased_shapes, aliases = make_aliased_shapes(
-    jtfu, input_output_aliases, pure_out_shapes, aliased_shapes, args, kwargs
-  )
-  # structure of `aliased_shapes` would help to return aliased arrays in a proper form,
-  # and flattened values are simply the shapes to pass to the .bind() method.
-  # `aliases` would help to generate properly array-only indexed operand_output_aliases
-
   # TODO(Arech) improve error reporting and check assumptions violation. We have a ton
   # of assumptions, requiring a certain behavior from a user. For most if not all of the
   # assumptions it's possible to verify them. We just don't do this b/c of performance
@@ -2309,24 +2303,45 @@ def triton_call(
   # with the uncached run and all subsequent runs will be blazingly fast. (2) we already
   # have a `debug` parameter that is meant precisely for that.
 
+  # Python guarantees the keys don't exist. The original Triton has a single namespace
+  # for both constexprs and backend options, and we're doing the same to unify processing
+  # We are setting defaults here early, since we use values early
+  kwargs["num_warps"] = num_warps if num_warps is not None else 4
+  kwargs["num_stages"] = num_stages if num_stages is not None else 3
+  kwargs["num_ctas"] = num_ctas
+  kwargs["enable_fp_fusion"] = enable_fp_fusion
+  kwargs["debug"] = debug
+
   if input_output_aliases is None:
-    input_output_aliases = {}
+    input_output_aliases = tuple()
 
-  # TODO fix it back
-  # out_shape = canonicalize_out_shape(jtfu, out_shape, out_names, args)
-  # forget out_names now
-  # TODO reconstruct out_shapes after the bind and append them to args properly
-  # TODO lowering must construct the same compounds as specified by out_shapes.
-  # flat_out_shapes, out_tree = tree_util.tree_flatten(tuple(out_shape.values()))
-
-  out_shape = tree_util.tree_map(
-    lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), out_shape
+  jtfu = JTJITFunction(kernel)
+  pure_out_shapes, aliased_shapes = canonicalize_out_shape(
+    jtfu, out_shape, out_names, args, input_output_aliases
   )
-  flat_out_shapes, out_tree = tree_util.tree_flatten(out_shape)
+  # now the structure of `pure_out_shapes` would let us reconstruct the output variables
+  # for Triton using ctx.avals_out instead of arrays, and the dict keys would let us
+  # place them correctly into args/kwargs. And also to properly structure returned
+  # outputs from the call
+  aliased_shapes, aliases = make_aliased_shapes(
+    jtfu, input_output_aliases, pure_out_shapes, aliased_shapes, args, kwargs
+  )
+  # structure of `aliased_shapes` would help to return aliased arrays in a proper form,
+  # and flattened values are simply the shapes to pass to the .bind() method.
+  # `aliases` would help to generate properly array-only indexed
+  # `operand_output_aliases` property to use ffi interface
+  abs_args, abs_kwargs, array_id2idx, num_input_arrays, args_kwargs_meta = (
+    serialize_args_kwargs(jtfu, args, kwargs)
+  )
 
-  
-
-  abs_args, abs_kwargs, args_kwargs_meta = serialize_args_kwargs(jtfu, args, kwargs)
+  pure_out_shapes_flat, pure_out_tree = tree_util.tree_flatten(pure_out_shapes)
+  aliased_shapes_flat, aliased_tree = tree_util.tree_flatten(aliased_shapes)
+  aliased_shape_ids2idx = {id(s): i for i, s in enumerate(aliased_shapes_flat)}
+  operand_output_aliases = {
+    array_id2idx[arr_id]: aliased_shape_ids2idx[shp_id]
+    for arr_id, shp_id in aliases.items()
+  }
+  num_pure_outputs = len(pure_out_shapes_flat)
 
   out_flat = triton_kernel_call_p.bind(
     *abs_args,
@@ -2334,16 +2349,26 @@ def triton_call(
     fn=kernel,
     kernel_call_name=name,
     custom_call_target_name=custom_call_target_name,
-    # out_shapes must be a flat sequence of shapes of ALL array whose result must be
-    # returned, i.e. output + input/output arrays.
-    out_shapes=tuple(flat_out_shapes),
+    # out_shapes must be a flat sequence of shapes of ALL arrays whose result must be
+    # returned, i.e. output + input/output=aliased arrays.
+    out_shapes=tuple(pure_out_shapes_flat) + tuple(aliased_shapes_flat),
     grid=grid,
     compute_capability=compute_capability,
-    input_output_aliases=tuple(input_output_aliases.items()),
+    operand_output_aliases=tuple(operand_output_aliases.items()),
     zeroed_outputs=zeroed_outputs,
     serialized_metadata=serialized_metadata,
     args_kwargs=args_kwargs_meta,
-    # out_info=(tuple(out_shape.keys()), out_tree),
-    out_info=(None, out_tree),
+    out_info=(num_input_arrays, num_pure_outputs, pure_out_tree),
   )
-  return tree_util.tree_unflatten(out_tree, out_flat)
+
+  pure_outs = (
+    tree_util.tree_unflatten(pure_out_tree, out_flat[:num_pure_outputs])
+    if num_pure_outputs > 0
+    else ()
+  )
+  aliased_outs = (
+    tree_util.tree_unflatten(aliased_tree, out_flat[num_pure_outputs:])
+    if len(aliased_shapes_flat) > 0
+    else ()
+  )
+  return pure_outs + aliased_outs
