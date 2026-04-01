@@ -914,14 +914,9 @@ def make_kernel_params(
   kwargs: dict[str, Any],
   grid,
   zeroed_outputs,
-  input_output_aliases: dict[int, int],
   configs: list[triton.Config],
 ) -> list[dict[str, Any]]:
   """Make kernel call parameters for each config."""
-  output2input = {v: k for k, v in input_output_aliases.items()}
-  if len(output2input) != len(input_output_aliases):
-    raise ValueError("input_output_aliases must be a bijection")
-
   zeroed_outputs_callable = callable(zeroed_outputs)
 
   kernel_params = []
@@ -945,18 +940,11 @@ def make_kernel_params(
 
     # zeroed_params_with_sizes is a dict arg_idx -> aval_size_bytes
     # config_zeroed_outputs is a list of ordinal numbers of output arguments
+    # TODO make `zeroed_outputs` based on :in_spec: instead of raw array indices
     zeroed_params_with_sizes = {
-      output2input[i] if i in output2input else i + outputs_offset: aval_size_bytes(
-        ctx.avals_out[i]
-      )
+      i + outputs_offset: aval_size_bytes(ctx.avals_out[i])
       for i in config_zeroed_outputs
     }
-    # TODO turning zeroed_params_with_sizes keys to _array_ indices only (i.e.
-    # rely only on ctx.avals_in) will help get rid of dependency on scalars number
-    # completely. But this requires "subtracting" relevant scalar numbers from
-    # output2input values too (doable as we know all of that). Then we'd need to modify
-    # `triton_kernel_call_lib.create_array_parameter()` call below.
-    # NOTE this might also resolve the BUG with complex paths
 
     kernel_params.append(
       dict(
@@ -972,37 +960,39 @@ def make_kernel_params(
 
 
 def add_output_args(
+  jtfu: JTJITFunction,
   ctx,
-  input_output_aliases: dict[int, int],
-  out_names: tuple[str, ...] | None,
+  out_info: tuple[int, int, tree_util.PyTreeDef],
   args: list[Any],
   kwargs: dict[str, Any],
 ) -> tuple[list[Any], dict[str, Any]]:
   """Add output arguments to the argument list/dictionary."""
-  # Note we should use only the output avals not referenced in the
-  # input_output_aliases mapping.
-  if out_names is None:
-    # We don't have information where the output parameters really are, so we can only
-    # assume they follow positional args passed to `.triton_call()`.
-    args.extend([
-      JTArray(aval)
-      for i, aval in enumerate(ctx.avals_out)
-      if i not in input_output_aliases.values()
-    ])
-  else:
-    assert len(out_names) == len(ctx.avals_out), (
-      "output_names and out_shapes must have the same length"
-    )
-    assert all(oarg not in kwargs for oarg in out_names), (
-      "Output arguments are implicit and should not be passed!"
-    )
-    kwargs.update({
-      oarg: JTArray(ctx.avals_out[i])
-      for i, oarg in enumerate(out_names)
-      if i not in input_output_aliases.values()
-    })
+  num_pure_outputs, pure_out_tree = out_info
+  assert num_pure_outputs <= len(ctx.avals_out)
 
-  return args, kwargs
+  outputs = tree_util.tree_unflatten(
+    pure_out_tree, (JTArray(ctx.avals_out[i]) for i in range(num_pure_outputs))
+  )
+  # it's a dict mapping out-spec -> possibly nested structure of 1 or many JTArrays
+
+  idx2name = jtfu.index_to_arg_name
+  for out_spec, arrays in outputs.items():
+    assert isinstance(out_spec, tuple)
+    top_idx = out_spec[0]
+    assert isinstance(top_idx, int)
+    arg_name = idx2name[top_idx]
+    if top_idx < len(args):
+      raise ValueError(f"Output argument idx {top_idx}={arg_name} mustn't be in args")
+    if len(out_spec) == 1:
+      if arg_name in kwargs:
+        raise ValueError(f"Output argument {arg_name} mustn't be in kwargs")
+      kwargs[arg_name] = arrays
+    else:
+      raise ValueError(
+        f"Output argument spec for {arg_name} is a nested {out_spec} and we don't currently support that"
+      )
+  return kwargs
+  
 
 
 def triton_kernel_call_lowering(
@@ -1033,40 +1023,12 @@ def triton_kernel_call_lowering(
   #input_output_aliases = dict[int, int](input_output_aliases)
   operand_output_aliases = dict[int, int](operand_output_aliases)
 
-  out_spec, out_tree = out_info
-  assert out_spec is None or (
-    len(out_spec) == len(out_shapes) and len(out_spec) == len(ctx.avals_out)
-  ), "If out_names set, out_names and out_shapes must have the same length"
-
   jtfu = JTJITFunction(fn)
 
   args, kwargs = deserialize_args_kwargs(ctx, abstract_args, args_kwargs)
-  # MEGAKWARGS:
-  # 0. a. making arguments for output params for Triton would require knowing output names
-  # this either requires out_names, or could also work on an assumption that right
-  # after positional `args` passed to triton_call() there are N output args, from
-  # which we can infer these arg names. That's an existing assumption too. Just need to
-  # store the offset in the serializer.
-  #    b. input_output_aliases should be name based, or we should otherwise prevent
-  # constructing output args for aliased buffers. A new form of input_output_aliases
-  # would not even have output buffers at all, so that will simplify the construction.
-  # Old form could be brought to the new one with validation (ensure out buffers are
-  # the last elements of `out_shape` seq; `out_shape` form becomes a form of out args)
-  #
-  # 1. autotuner and Heuristics needs named_args constructed only from positional args,
-  # not just all kwargs (not sure this is important, but the upstream also uses only
-  # positionals). So I could make megakwargs work if args dict is a dedicated dict.
-  #
-  # 2. zeroed_outputs don't need to support aliased buffers. Proper zeroing only
-  # requires knowing the location/indices of the output args.
-  #
-  # 3. operand_output_aliases for ffi_lowering() could be built from
-  # input_output_aliases by knowing proper outputs offset again and their number.
-  # Aliases go after them. Only need to respect the ordering.
 
-  outputs_offset = len(args)
   # extending with outputs
-  args, kwargs = add_output_args(ctx, input_output_aliases, out_spec, args, kwargs)
+  kwargs = add_output_args(jtfu, ctx, out_info, args, kwargs)
 
   if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
     # Note `fn.arg_names` below isn't `JITFunction::arg_names`: Autotuner and
@@ -1100,11 +1062,10 @@ def triton_kernel_call_lowering(
   # TODO make_kernel_params might be a method of JTJITFunction
   kernel_params = make_kernel_params(
     ctx,
-    outputs_offset,
+    len(abstract_args),
     kwargs,
     grid,
     zeroed_outputs,
-    input_output_aliases,
     configs,
   )
 
@@ -1122,18 +1083,20 @@ def triton_kernel_call_lowering(
     call_params = []
     #zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
     zeroed_params_with_sizes = params["zeroed_params_with_sizes"]
+    array_idx = 0
 
     for path, arg in non_constexprs.items():
       if isinstance(arg, JTArray):
-        assert len(path) == 1, "complex paths are not supported yet"
+        # assert len(path) == 1, "complex paths are not supported yet"
         arg_attrs = specialization_attr[path]
         call_params.append(
           triton_kernel_call_lib.create_array_parameter(
-            zeroed_params_with_sizes.get(path[0], 0),
+            zeroed_params_with_sizes.get(array_idx, 0),
             16 if (["tt.divisibility", 16] in arg_attrs) else 0,
             # TODO improve above ^^
           )
         )
+        array_idx += 1
       else:
         dtype = get_type_id(arg)
         call_params.append(triton_kernel_call_lib.create_scalar_parameter(arg, dtype))
@@ -1543,12 +1506,11 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   return (
     abs_args.values(),  # intentionally not materialized
     abs_kwargs_list,
-    array_id2idx,  # array id -> flat array index mapping
-    idx_offset,  # total number of input arrays
+    array_id2idx,  # mapping: array id -> flat array index
     (  # first go args info
       args_tree,  # structure of args
       tuple(abs_args.keys()),  # array positions in args
-      tuple(static_args),  # leftover after arrays removed
+      tuple(static_args),  # leftover args after arrays removed
       # then kwargs info
       tuple(abs_kwargs_meta.items()),
       to_hashable_metaparams(kwargs),  # leftover kwargs
@@ -1741,7 +1703,7 @@ def make_aliased_shapes(
   orig_aliased_shapes: Sequence[jax.ShapeDtypeStruct],
   args: list[Any],
   kwargs: dict[str, Any],
-) -> tuple[list[jax.ShapeDtypeStruct], dict[ArrayId, OutShapeId]]:
+) -> tuple[tuple[jax.ShapeDtypeStruct], dict[ArrayId, OutShapeId]]:
   """Uses `input_output_aliases` to produce a tuple of aliased shapes to append to
   `out_shapes` for the Primitive's .bind() call, and a dict mapping input array
   identifiers to output array identifiers. After serialization, we'll be able to
@@ -1758,25 +1720,24 @@ def make_aliased_shapes(
   idx2name = jtfu.index_to_arg_name
   aliases = {}
 
-  def _impl(elm: Any, shapes: list[jax.ShapeDtypeStruct] | None = None) -> None:
-    nonlocal aliases
-    if shapes is None:
-      shapes = []
+  def _make_aliased(elm: Any, shapes: list[jax.ShapeDtypeStruct]) -> None:
     if isinstance(elm, list) or (
       isinstance(elm, tuple) and isinstance(elm[0], (tuple, list))
     ):
       inner_shapes = []
-      tuple(_impl(e, inner_shapes) for e in elm)
+      tuple(_make_aliased(e, inner_shapes) for e in elm)
       assert len(inner_shapes) == len(elm)
       shapes.append(tuple(inner_shapes))
     else:
-      shapes = _in_spec_to_ShapeDtypeStruct(
+      nonlocal aliases
+      _in_spec_to_ShapeDtypeStruct(
         elm, args, kwargs, name2idx, idx2name, aliases, shapes
       )
-    return shapes
 
-  aliased_shapes = _impl(in_spec)
-
+  aliased_shapes = []
+  tuple(_make_aliased(e, aliased_shapes) for e in in_spec)
+  # aliased_shapes = _make_aliased(in_spec) if in_spec else []
+  
   # TODO perhaps remove it to spare cycles?
   # if it's a dict, validating that out_shapes match to aliased_shapes
   if is_dict: # and kwargs["debug"]:
@@ -1792,7 +1753,7 @@ def make_aliased_shapes(
           f"Output shape {aliased_shapes[oidx]} at index {oidx} doesn't match to the shape "
           f"in `out_shape[{oidx + aliased_idx}]` {orig_aliased_shapes[oidx]}"
         )
-  return aliased_shapes, aliases
+  return tuple(aliased_shapes), aliases
 
 
 def _split_out_values(
@@ -2157,6 +2118,11 @@ def triton_call(
       in the `out_shape` sequence, and aliased buffers must go last in the sequence.
       Interleaving output with in/out argument shapes in `out_shape` isn't supported.
       User is responsible for adhering to the requirement.
+      
+      Note, this might be a BREAKING change, since originally indices referenced arrays
+      in inputs only. Now indices are essentially an :in-spec: to :out-spec: mapping,
+      so they reference parameters in the kernel's signature coordinate space.
+      
       (2 - recommended): a non-dictionary form expands to an ordered, potentially
       nested, sequence of input array coordinates in the kernel's signature coordinate
       space. For this form there should be no corresponding output arguments in the
@@ -2330,18 +2296,28 @@ def triton_call(
   # and flattened values are simply the shapes to pass to the .bind() method.
   # `aliases` would help to generate properly array-only indexed
   # `operand_output_aliases` property to use ffi interface
-  abs_args, abs_kwargs, array_id2idx, num_input_arrays, args_kwargs_meta = (
+  abs_args, abs_kwargs, array_id2idx, args_kwargs_meta = (
     serialize_args_kwargs(jtfu, args, kwargs)
   )
 
   pure_out_shapes_flat, pure_out_tree = tree_util.tree_flatten(pure_out_shapes)
+  num_pure_outputs = len(pure_out_shapes_flat)
+
   aliased_shapes_flat, aliased_tree = tree_util.tree_flatten(aliased_shapes)
-  aliased_shape_ids2idx = {id(s): i for i, s in enumerate(aliased_shapes_flat)}
+  aliased_shape_ids2idx = {  # shape id -> raw output array idx
+    id(s): i + num_pure_outputs for i, s in enumerate(aliased_shapes_flat)
+  }
   operand_output_aliases = {
     array_id2idx[arr_id]: aliased_shape_ids2idx[shp_id]
     for arr_id, shp_id in aliases.items()
   }
-  num_pure_outputs = len(pure_out_shapes_flat)
+  num_aliased_outputs = len(aliased_shapes_flat)
+  
+
+  if num_pure_outputs <= 0 and num_aliased_outputs <= 0:
+    raise ValueError("The kernel should have at least one output or in-out argument")
+
+  # TODO preprocessing of zeroed_outputs if possible
 
   out_flat = triton_kernel_call_p.bind(
     *abs_args,
@@ -2350,7 +2326,7 @@ def triton_call(
     kernel_call_name=name,
     custom_call_target_name=custom_call_target_name,
     # out_shapes must be a flat sequence of shapes of ALL arrays whose result must be
-    # returned, i.e. output + input/output=aliased arrays.
+    # returned, i.e. output + input-output=aliased arrays.
     out_shapes=tuple(pure_out_shapes_flat) + tuple(aliased_shapes_flat),
     grid=grid,
     compute_capability=compute_capability,
@@ -2358,17 +2334,18 @@ def triton_call(
     zeroed_outputs=zeroed_outputs,
     serialized_metadata=serialized_metadata,
     args_kwargs=args_kwargs_meta,
-    out_info=(num_input_arrays, num_pure_outputs, pure_out_tree),
+    out_info=(num_pure_outputs, pure_out_tree),
   )
 
   pure_outs = (
     tree_util.tree_unflatten(pure_out_tree, out_flat[:num_pure_outputs])
     if num_pure_outputs > 0
-    else ()
+    else {}
   )
   aliased_outs = (
     tree_util.tree_unflatten(aliased_tree, out_flat[num_pure_outputs:])
-    if len(aliased_shapes_flat) > 0
+    if num_aliased_outputs > 0
     else ()
   )
-  return pure_outs + aliased_outs
+  ret = tuple(pure_outs.values()) + aliased_outs
+  return ret if len(ret) > 1 else ret[0]

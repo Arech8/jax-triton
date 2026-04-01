@@ -95,10 +95,11 @@ class ArgsKwargsTest(parameterized.TestCase):
       def __getitem__(self, i):
         return self.flat[i]
 
-    abs_args, abs_kwargs, args_kwargs_meta = jttl.serialize_args_kwargs(
+    abs_args, abs_kwargs, aliases, args_kwargs_meta = jttl.serialize_args_kwargs(
       jttl.JTJITFunction(kernel), args, deepcopy(kwargs)
       # kwargs could be modified, hence must copy
     )
+    # TODO TEST aliases here too!!
     ctx = types.SimpleNamespace(avals_in=FakeAvals())
     dargs, dkwargs = jttl.deserialize_args_kwargs(
       ctx, [*abs_args, *abs_kwargs], args_kwargs_meta
@@ -643,17 +644,69 @@ class TritonKernelCallTest(parameterized.TestCase):
 
   @parameterized.parameters(False, True)
   def test_zeroed_outputs(self, use_function):
-    x, y = create_random_inputs([1000000])
-    # We alias `y` with the output, so are performing the add in-place.
-    # If we zero the output before the kernel, the result is `x + 0`.
-    out = add(
-        x,
-        y,
-        input_output_aliases={1: 0},
-        kernel=add_inplace_kernel,
-        INPLACE_Y=True,
-        zeroed_outputs=(lambda _: (0,)) if use_function else (0,),
+    # Previously the test was based on zeroing an in-out argument. The problem with that
+    # is that zeroing in-out arguments doesn't seem to have any real-world use, since
+    # it just turns an in-out argument back into purely output argument, all while
+    # likely still requiring the backend to copy the argument content from host to device
+    # before clearing it. I.e. letting no information to pass into the kernel via the
+    # argument. Implementing that feature with a proper support for tuples is cumbersome
+    # and worth the effort considering it has no real-world use beyond this test.
+    #
+    # But supporting zeroing of purely output arguments is tricky, since when the
+    # backend initially allocates memory on a device, the memory comes from a driver
+    # always already zeroed due to security concerns. This test now is based on an
+    # observed backend behavior that if the same kernel is launched 2 times while the
+    # outputs of the first run are discarded, then on the next run kernel's purely
+    # output argument will retain its old "dirty" values. If this behavior changes,
+    # the test will become flaky. To properly check this behavior, we must make a
+    # kernel agnostic to all possible runs of previous tests.
+    # Unfortunately, I don't have better ideas at this time how to test this in a less
+    # flaky fashion.
+
+    @jt.kernel
+    @triton.jit
+    def zeroing_kernel(
+      x_ptr: tl.const,
+      n_elements,
+      out_ptr,
+      BLOCK_SIZE: tl.constexpr,
+      CLEANUP: tl.constexpr = False,
+    ):
+      pid = tl.program_id(axis=0)
+      block_start = pid * BLOCK_SIZE
+      offsets = block_start + tl.arange(0, BLOCK_SIZE)
+      mask = offsets < n_elements
+      # explicit cleanup is needed to isolate the kernel from previous tests run history
+      if CLEANUP:
+        tl.store(out_ptr + offsets, 0, mask=mask)
+      x = tl.load(x_ptr + offsets, mask=mask)
+      y = tl.load(out_ptr + offsets, mask=mask)
+      output = x + y
+      tl.store(out_ptr + offsets, output, mask=mask)
+
+    x = random.normal(random.key(0), shape=1000000)
+    BLOCK_SIZE = 8
+    grid = triton.cdiv(x.size, BLOCK_SIZE)
+
+    # first test the backend behavior, that sequential calls use dirty outputs.
+    out = zeroing_kernel[grid](
+      x, x.size, BLOCK_SIZE=BLOCK_SIZE, CLEANUP=True, out_shape=x
     )
+    np.testing.assert_allclose(out, x)
+    del out
+
+    out = zeroing_kernel[grid](x, x.size, BLOCK_SIZE=BLOCK_SIZE, out_shape=x)
+    np.testing.assert_allclose(
+      out,
+      2 * x,
+      err_msg="This test's assumption that subsequent calls use dirty buffers is "
+      "violated (likely because of the backend behavior change). This makes the test "
+      "either flaky or useless. Anyway, the test needs to be fixed and until that the "
+      "best possible solution is to disable/skip this test.",
+    )
+    del out
+
+    out = zeroing_kernel[grid](x, x.size, BLOCK_SIZE=BLOCK_SIZE, out_shape=x, zeroed_outputs=(0,))
     np.testing.assert_allclose(out, x)
 
   def test_multiple_outputs(self):
