@@ -992,7 +992,6 @@ def add_output_args(
         f"Output argument spec for {arg_name} is a nested {out_spec} and we don't currently support that"
       )
   return kwargs
-  
 
 
 def triton_kernel_call_lowering(
@@ -1019,8 +1018,8 @@ def triton_kernel_call_lowering(
   #   with input_output_aliases.
   # 2. providing additional buffers to zero when JAX's launcher is called.
   # 3. provide a raw index mapping from inputs to outputs for the backend
-  #assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
-  #input_output_aliases = dict[int, int](input_output_aliases)
+  # assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
+  # input_output_aliases = dict[int, int](input_output_aliases)
   operand_output_aliases = dict[int, int](operand_output_aliases)
 
   jtfu = JTJITFunction(fn)
@@ -1076,12 +1075,12 @@ def triton_kernel_call_lowering(
       ctx.module_context.platforms[0],
       args,
       compute_capability=compute_capability,
-      #kwargs=dict(params["metaparams"]),
+      # kwargs=dict(params["metaparams"]),
       kwargs=params["metaparams"],
     )
 
     call_params = []
-    #zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
+    # zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
     zeroed_params_with_sizes = params["zeroed_params_with_sizes"]
     array_idx = 0
 
@@ -1190,228 +1189,6 @@ class ShapeDtype(Protocol):
   def dtype(self) -> np.dtype: ...
 
 
-def to_hashable_metaparams(metaparams: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
-  """Converts metaparams to a tuple so it could be hashable while caring for certain
-  keys this are known to be unhashable."""
-  # Triton doesn't support passing unhashable values as metaparams, however, these
-  # metaparams might also contain backend options, and some of them are dicts. So far,
-  # there's only one such option - `extern_libs`, both in AMD and NVIDIA backends.
-  # While it might be possible to use `tree_util.tree_flatten(metaparams)` here, it's
-  # too expensive for handling such a rare case. Instead, we do this manually.
-  # This is somewhat fragile and might require some maintenance to adapt to new options
-  # but the kernel launcher is a hot path, so this seem tolerable.
-  if "extern_libs" in metaparams:
-    metaparams["extern_libs"] = tuple(metaparams["extern_libs"].items())
-  return tuple(metaparams.items())
-
-
-def from_hashable_metaparams(astuple: tuple[tuple[str, Any], ...]) -> dict[str, Any]:
-  """Converts a tuple of metaparams back to a dictionary."""
-  assert isinstance(astuple, tuple), "astuple must be a tuple of metaparam items"
-  metaparams = dict(astuple)
-  if "extern_libs" in metaparams:
-    metaparams["extern_libs"] = dict(metaparams["extern_libs"])
-  return metaparams
-
-
-
-# the original func, serializing as is
-"""
-def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
-  " ""Prepares args and kwargs for passing through JAX's primitive system by separating
-  things that must be traced from things that must be passed as is.
-
-  Returns two sequences of traced values and a tuple of hashable reconstruction info.
-  Assumes that a caller adheres to the Triton's rules about argument types, so no
-  special checks for hashability are done for performance reasons.
-
-  Note that the function consumes kwargs, i.e. its state is modified in place.
-  "" "
-  assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
-  # JAX's Primitive.bind(*args, **params) has a strict dichotomy:
-  # - *args (positional) are dynamic operands — values that participate in JAX's
-  # tracing/transformation system (jit, grad, vmap). During JIT compilation, they become
-  # abstract values (ShapedArray) and then MLIR SSA values in the lowered IR.
-  # - **params (keyword) are static parameters — they must be hashable, are passed
-  # through verbatim, and retain their concrete Python values across the entire
-  # compilation pipeline.
-  # Hence to pass data through JAX's primitive system we must separate things that must
-  # be traced from things that must be passed as is. The restriction is that since JAX
-  # arrays must be managed by XLA, they must be passed as traced items. The rest could
-  # go concrete helping to specialize the kernel properly.
-  # We must implement the separation in a way that (1) allows to reconstruct both `args`
-  # and `kwargs` back exactly on the other end to process them properly, and (2) all JAX
-  # array arguments go into .bind() call in exactly the same order as the kernel expects
-  # them (so we don't have to reshuffle them later during the lowering). In that we
-  # assume that no JAX array could be specialized to a constexpr for compiling, which
-  # holds in the upstream Triton too (small arrays could be passed as tuples/lists
-  # though to constexpr annotated params).
-
-  flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
-  # We must let Nones to pass through flattening and `is_leaf` semantic is additive.
-
-  # Since there's usually much more non-vector parameters than vectors, extracting
-  # vectors from flat_args. Jax explicitly guarantee that `isinstance(x, jnp.ndarray)`
-  # check behaves correctly for raw arrays as well as for tracers. For jitting all/most
-  # of Python scalars are mapped to ShapedArray avals too, so they are treated as arrays
-  # by the check. However, there's no use-case where we might want to pass a scalar as a
-  # traceable thing into the kernel call, so we can safely assume a user will mark it as
-  # a static argument for jitting (the old implementation relied on that too).
-  abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
-  static_args = (to_python_type(v) for v in flat_args if not isinstance(v, jax.Array))
-  # we're going to pass flat_args as static params now. There's a caveat at least for
-  # tl.constexpr() objects: JAX's lowering code seems to require only hashability
-  # and correct equality semantics for static objects, and this is true for
-  # tl.constexpr() with a nuance: on comparison it returns not a bool True/False, but
-  # another tl.constexpr() object with a bool value. So if there's a silly check in JAX
-  # that the `(a==b) is True`, or `type(a==b) is bool` - it'll break.
-
-  # Now do the same for kwargs with a caveat - we must traverse them in order of kernel
-  # parameters declaration to ensure arrays ends up in a correct order
-  def contain_arrays(v):
-    if isinstance(v, jax.Array):
-      return True
-    elif isinstance(v, tuple):  # among pytrees only tuples could be passed as arguments
-      return any(contain_arrays(x) for x in v)
-    return False
-
-  class _FakeVal: ...
-
-  abs_kwargs_list = []  # only values to abstract
-  abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
-  for aname in jtfu.arg_names:
-    # if kwargs has that parameter AND the value contains an array somewhere (including
-    # nested tuples/lists), we handle the whole arg value differently to be able to
-    # reconstruct it correctly. Otherwise we just skip the arg to pass it along with
-    # other kwargs, such as backend options.
-    arg_val = kwargs.get(aname, _FakeVal())
-    if contain_arrays(arg_val):
-      del kwargs[aname]  # handle the value differently
-      if isinstance(arg_val, jax.Array):  # shortcutting if the value is a raw array
-        abs_kwargs_list.append(arg_val)
-        abs_kwargs_meta[aname] = None
-      else:  # do full flattening
-        flat_v, the_tree = tree_util.tree_flatten(arg_val)
-        abs_v = {i: v for i, v in enumerate(flat_v) if isinstance(v, jax.Array)}
-        static_v = (to_python_type(v) for v in flat_v if not isinstance(v, jax.Array))
-        abs_kwargs_list.extend(abs_v.values())
-        abs_kwargs_meta[aname] = (tuple(static_v), tuple(abs_v.keys()), the_tree)
-
-  return (
-    abs_args.values(),  # intentionally not materialized
-    abs_kwargs_list,
-    (  # first go args info
-      args_tree,
-      tuple(abs_args.keys()),
-      tuple(static_args),
-      # then kwargs info
-      tuple(abs_kwargs_meta.items()),
-      to_hashable_metaparams(kwargs),
-    ),
-  )
-"""
-
-# modified version to store all args as kwargs
-"""
-def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
-  " ""Prepares args and kwargs for passing through JAX's primitive system by separating
-  things that must be traced from things that must be passed as is.
-
-  Returns two sequences of traced values and a tuple of hashable reconstruction info.
-  Assumes that a caller adheres to the Triton's rules about argument types, so no
-  special checks for hashability are done for performance reasons.
-
-  Note that the function consumes kwargs, i.e. its state is modified in place.
-  "" "
-  assert isinstance(jtfu, JTJITFunction), "jtfu must be a JTJITFunction object"
-  # JAX's Primitive.bind(*args, **params) has a strict dichotomy:
-  # - *args (positional) are dynamic operands — values that participate in JAX's
-  # tracing/transformation system (jit, grad, vmap). During JIT compilation, they become
-  # abstract values (ShapedArray) and then MLIR SSA values in the lowered IR.
-  # - **params (keyword) are static parameters — they must be hashable, are passed
-  # through verbatim, and retain their concrete Python values across the entire
-  # compilation pipeline.
-  # Hence to pass data through JAX's primitive system we must separate things that must
-  # be traced from things that must be passed as is. The restriction is that since JAX
-  # arrays must be managed by XLA, they must be passed as traced items. The rest could
-  # go concrete helping to specialize the kernel properly.
-  # We must implement the separation in a way that (1) allows to reconstruct both `args`
-  # and `kwargs` back exactly on the other end to process them properly, and (2) all JAX
-  # array arguments go into .bind() call in exactly the same order as the kernel expects
-  # them (so we don't have to reshuffle them later during the lowering). In that we
-  # assume that no JAX array could be specialized to a constexpr for compiling, which
-  # holds in the upstream Triton too (small arrays could be passed as tuples/lists
-  # though to constexpr annotated params).
-
-  idx2name = jtfu.index_to_arg_name
-  kwargs.update({idx2name[i]: a for i, a in enumerate(args)})
-
-  # flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
-  # We must let Nones to pass through flattening and `is_leaf` semantic is additive.
-
-  # Since there's usually much more non-vector parameters than vectors, extracting
-  # vectors from flat_args. Jax explicitly guarantee that `isinstance(x, jnp.ndarray)`
-  # check behaves correctly for raw arrays as well as for tracers. For jitting all/most
-  # of Python scalars are mapped to ShapedArray avals too, so they are treated as arrays
-  # by the check. However, there's no use-case where we might want to pass a scalar as a
-  # traceable thing into the kernel call, so we can safely assume a user will mark it as
-  # a static argument for jitting (the old implementation relied on that too).
-  #abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
-  abs_args = {}
-  # static_args = (to_python_type(v) for v in flat_args if not isinstance(v, jax.Array))
-  static_args = tuple()
-  # we're going to pass flat_args as static params now. There's a caveat at least for
-  # tl.constexpr() objects: JAX's lowering code seems to require only hashability
-  # and correct equality semantics for static objects, and this is true for
-  # tl.constexpr() with a nuance: on comparison it returns not a bool True/False, but
-  # another tl.constexpr() object with a bool value. So if there's a silly check in JAX
-  # that the `(a==b) is True`, or `type(a==b) is bool` - it'll break.
-
-  # Now do the same for kwargs with a caveat - we must traverse them in order of kernel
-  # parameters declaration to ensure arrays ends up in a correct order
-  def contain_arrays(v):
-    if isinstance(v, jax.Array):
-      return True
-    elif isinstance(v, tuple):  # among pytrees only tuples could be passed as arguments
-      return any(contain_arrays(x) for x in v)
-    return False
-
-  class _FakeVal: ...
-
-  abs_kwargs_list = []  # only values to abstract
-  abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
-  for aname in jtfu.arg_names:
-    # if kwargs has that parameter AND the value contains an array somewhere (including
-    # nested tuples/lists), we handle the whole arg value differently to be able to
-    # reconstruct it correctly. Otherwise we just skip the arg to pass it along with
-    # other kwargs, such as backend options.
-    arg_val = kwargs.get(aname, _FakeVal())
-    if contain_arrays(arg_val):
-      del kwargs[aname]  # handle the value differently
-      if isinstance(arg_val, jax.Array):  # shortcutting if the value is a raw array
-        abs_kwargs_list.append(arg_val)
-        abs_kwargs_meta[aname] = None
-      else:  # do full flattening
-        flat_v, the_tree = tree_util.tree_flatten(arg_val)
-        abs_v = {i: v for i, v in enumerate(flat_v) if isinstance(v, jax.Array)}
-        static_v = (to_python_type(v) for v in flat_v if not isinstance(v, jax.Array))
-        abs_kwargs_list.extend(abs_v.values())
-        abs_kwargs_meta[aname] = (tuple(static_v), tuple(abs_v.keys()), the_tree)
-
-  return (
-    abs_args.values(),  # intentionally not materialized
-    abs_kwargs_list,
-    (  # first go args info
-      args_tree,
-      tuple(abs_args.keys()),
-      tuple(static_args),
-      # then kwargs info
-      tuple(abs_kwargs_meta.items()),
-      to_hashable_metaparams(kwargs),
-    ),
-  )
-"""
-
 def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   """Prepares args and kwargs for passing through JAX's primitive system by separating
   things that must be traced from things that must be passed as is.
@@ -1454,7 +1231,7 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   # a static argument for jitting (the old implementation relied on that too).
   abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
   # counting raw arrays to build `operand_output_aliases` mapping
-  array_id2idx = {id(v):idx for idx, v in enumerate(abs_args.values())}
+  array_id2idx = {id(v): idx for idx, v in enumerate(abs_args.values())}
   # Note that we assume user won't pass the same array several times in args or in
   # kwargs AND would want to alias it, so not checking this here and below
 
@@ -1503,6 +1280,16 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
         abs_kwargs_list.extend(abs_v.values())
         abs_kwargs_meta[aname] = (tuple(static_v), tuple(abs_v.keys()), the_tree)
 
+  # Primitive's bind() doesn't support passing unhashable values as key-value arguments,
+  # however, kwargs might also contain backend options, and some of them are dicts. So
+  # far, there's only one such option - `extern_libs`, both in AMD and NVIDIA backends.
+  # While it might be possible to just use `tree_util.tree_flatten(metaparams)` here,
+  # it's too expensive for handling such a rare case. Instead, we do this manually.
+  # This is somewhat fragile and might require some maintenance to adapt to new options
+  # but the kernel launcher is a hot path, so this seem tolerable.
+  if "extern_libs" in kwargs:
+    kwargs["extern_libs"] = tuple(kwargs["extern_libs"].items())
+
   return (
     abs_args.values(),  # intentionally not materialized
     abs_kwargs_list,
@@ -1513,7 +1300,7 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
       tuple(static_args),  # leftover args after arrays removed
       # then kwargs info
       tuple(abs_kwargs_meta.items()),
-      to_hashable_metaparams(kwargs),  # leftover kwargs
+      tuple(kwargs.items()),  # leftover kwargs
     ),
   )
 
@@ -1546,7 +1333,13 @@ def deserialize_args_kwargs(
     args.insert(i, v)
   args = list(tree_util.tree_unflatten(args_tree, args))
 
-  kwargs = from_hashable_metaparams(kwargs)
+  # this reverses additional kwargs modifications by serializer
+  assert isinstance(kwargs, tuple), "kwargs must be a tuple here"
+  kwargs = dict(kwargs)
+  if "extern_libs" in kwargs:
+    kwargs["extern_libs"] = dict(kwargs["extern_libs"])
+
+  # now restore the rest of kwargs
   for aname, meta in abs_kwargs_meta.items():
     assert aname not in kwargs
     if meta is None:
@@ -1565,68 +1358,6 @@ def deserialize_args_kwargs(
 
   return args, kwargs
 
-# TODO is this needed?
-"""
-def _canonicalize_in_spec_element(
-  elm: InOutSpec,
-  args: list[Any],
-  kwargs: dict[str, Any],
-  name2idx: dict[str, int],
-  idx2name: dict[int, str],
-) -> CanonicalKernelArgPaths:
-  # this code runs each kernel launch, so proper validation is expensive here, so
-  # we skip most of checks allowing it just to fail, should the spec be incorrect.
-  # We might check some things later on the go.
-  orig_name = None
-  if isinstance(elm, int):
-    path = (elm,)
-  elif isinstance(elm, str):
-    orig_name = elm
-    path = (name2idx[elm],)  # user is responsible for correct indexing
-  elif isinstance(elm, (tuple, list)):
-    prim_idx = elm[0]
-    if isinstance(prim_idx, str):
-      orig_name = prim_idx
-      path = (name2idx[prim_idx], *elm[1:])
-    else:
-      path = elm
-  else:
-    raise ValueError(f"Invalid in_spec element: {elm}")
-  # checking if the path refers to a terminal array, or to a compound
-  prim_idx = path[0]
-  if prim_idx < len(args):  # must be in args by construction
-    arg = triton_runtime_jit.get_iterable_path(args, path)
-  else:  # must be in kwargs by construction
-    arg = triton_runtime_jit.get_iterable_path(
-      kwargs[idx2name[prim_idx] if orig_name is None else orig_name], path[1:]
-    )
-  if isinstance(arg, jax.Array):
-    return (path,)
-  # else it must be a tuple having arrays
-  tail = triton_runtime_jit.find_paths_if(arg, lambda _, x: isinstance(x, jax.Array))
-  if len(tail) == 0:
-    raise ValueError(f"Argument at in-spec '{elm}' ({path}) is not a jax.Array: {arg}")
-  return tuple((*path, *t) for t in tail)
-"""
-
-# TODO is this needed?
-"""
-def canonicalize_in_spec(
-  jtfu: JTJITFunction, in_spec: InOutSpec, args: list[Any], kwargs: dict[str, Any]
-) -> CanonicalKernelArgPaths:
-  "" "Turns multiple variants of possible :in_spec: forms into a single canonical form
-  consisting of a tuple collecting tuples of kernel signature parameter indices." ""
-  name2idx = jtfu.arg_name_to_index
-  idx2name = jtfu.index_to_arg_name
-  if not isinstance(in_spec, (list, tuple)):
-    in_spec = (in_spec,)
-  return tuple(
-    itertools.chain.from_iterable(  # to flatten the top-level iterable
-      _canonicalize_in_spec_element(elm, args, kwargs, name2idx, idx2name)
-      for elm in in_spec
-    )
-  )
-"""
 
 ArrayId = int
 OutShapeId = int
@@ -1672,7 +1403,7 @@ def _in_spec_to_ShapeDtypeStruct(
       kwargs[idx2name[param_idx] if orig_name is None else orig_name], path[1:]
     )
 
-  def _unpack_arg(_,elm: Any):
+  def _unpack_arg(_, elm: Any):
     nonlocal shapes, aliases
     if isinstance(elm, jax.Array):
       shape = jax.ShapeDtypeStruct(elm.shape, elm.dtype)
@@ -1713,7 +1444,7 @@ def make_aliased_shapes(
   # building aliased_shapes from in_spec
   is_dict = isinstance(input_output_aliases, dict)
   in_spec = list(input_output_aliases.keys()) if is_dict else input_output_aliases
-  if not isinstance(in_spec, (tuple,list)):
+  if not isinstance(in_spec, (tuple, list)):
     in_spec = [in_spec]
 
   name2idx = jtfu.arg_name_to_index
@@ -1737,10 +1468,10 @@ def make_aliased_shapes(
   aliased_shapes = []
   tuple(_make_aliased(e, aliased_shapes) for e in in_spec)
   # aliased_shapes = _make_aliased(in_spec) if in_spec else []
-  
+
   # TODO perhaps remove it to spare cycles?
   # if it's a dict, validating that out_shapes match to aliased_shapes
-  if is_dict: # and kwargs["debug"]:
+  if is_dict:  # and kwargs["debug"]:
     # getting a starting index of aliased shapes in the original out_shape for reading
     # a dict values
     aliased_idx = len(pure_out_shapes)
@@ -1909,65 +1640,6 @@ def _canonicalize_out_spec_element(
   # we don't need to dive deeper. We'll just create a variable for Triton with whatever
   # a corresponding element of out_shape has
   return path
-  """
-  # checking that a nested path refers to a ShapeDtypeStruct; If it's a compound -
-  # enhance the path to address all its elements.
-  # TODO: how do we use the output element paths? Can we shortcut here and only store
-  # a path to the relevant highest-level element of the signature?
-
-  arg = triton_runtime_jit.get_iterable_path(out_shapes, (elm_idx, *path[1:]))
-  if isinstance(arg, jax.ShapeDtypeStruct):
-    return (path,)
-  if not isinstance(arg, (list, tuple)):
-    raise ValueError(
-      f"Non-ShapeDtype argument at out-spec '{elm}' ({path}) is not a tuple: {arg}"
-    )
-  # else it must be a tuple having ShapeDtypes. Note that non-ShapeDtypeStruct
-  # non-compound objects will be silently ignored there, but that shouldn't happen
-  tail = triton_runtime_jit.find_paths_if(
-    arg, lambda _, x: isinstance(x, jax.ShapeDtypeStruct)
-  )
-  if len(tail) == 0:
-    raise ValueError(
-      f"Argument at out-spec '{elm}' ({path}) is not a jax.ShapeDtypeStruct or a tuple of them: {arg}"
-    )
-  return tuple((*path, *t) for t in tail)
-  """
-
-
-"""
-# TODO: is the function needed?
-def canonicalize_out_spec(
-  jtfu: JTJITFunction, out_spec: InOutSpec, out_shapes: Sequence[jax.ShapeDtypeStruct]
-) -> CanonicalKernelArgPaths:
-  name2idx = jtfu.arg_name_to_index
-  if not isinstance(out_spec, (list, tuple)):
-    out_spec = (out_spec,)
-  return tuple(
-    itertools.chain.from_iterable(  # to flatten the top-level iterable
-      _canonicalize_out_spec_element(elm, i, out_shapes, name2idx)
-      for i, elm in enumerate(out_spec)
-    )
-  )
-"""
-
-
-# TODO remove?
-def make_out_shapes(
-    pure_out_shapes: dict[CanonicalKernelArgPath, Sequence[jax.ShapeDtypeStruct]],
-    aliased_shapes: list[jax.ShapeDtypeStruct],
-    aliases: dict[ArrayId, OutShapeId],
-    array_id2idx: dict[ArrayId, int],
-    idx_offset: int,
-    ) -> tuple[tuple, tree_util.PyTreeDef, tree_util.PyTreeDef, dict[int, int]]:
-    """Returns:
-    - combined output+aliased arguments flat shapes as a tuple,
-    - their tree structure as a PyTreeDef,
-    - purely output arguments tree structure as a PyTreeDef,
-    - operand_output_aliases mapping."""
-    pass
-
-
 
 
 def triton_call(
@@ -2118,11 +1790,11 @@ def triton_call(
       in the `out_shape` sequence, and aliased buffers must go last in the sequence.
       Interleaving output with in/out argument shapes in `out_shape` isn't supported.
       User is responsible for adhering to the requirement.
-      
+
       Note, this might be a BREAKING change, since originally indices referenced arrays
       in inputs only. Now indices are essentially an :in-spec: to :out-spec: mapping,
       so they reference parameters in the kernel's signature coordinate space.
-      
+
       (2 - recommended): a non-dictionary form expands to an ordered, potentially
       nested, sequence of input array coordinates in the kernel's signature coordinate
       space. For this form there should be no corresponding output arguments in the
@@ -2296,8 +1968,8 @@ def triton_call(
   # and flattened values are simply the shapes to pass to the .bind() method.
   # `aliases` would help to generate properly array-only indexed
   # `operand_output_aliases` property to use ffi interface
-  abs_args, abs_kwargs, array_id2idx, args_kwargs_meta = (
-    serialize_args_kwargs(jtfu, args, kwargs)
+  abs_args, abs_kwargs, array_id2idx, args_kwargs_meta = serialize_args_kwargs(
+    jtfu, args, kwargs
   )
 
   pure_out_shapes_flat, pure_out_tree = tree_util.tree_flatten(pure_out_shapes)
@@ -2312,7 +1984,6 @@ def triton_call(
     for arr_id, shp_id in aliases.items()
   }
   num_aliased_outputs = len(aliased_shapes_flat)
-  
 
   if num_pure_outputs <= 0 and num_aliased_outputs <= 0:
     raise ValueError("The kernel should have at least one output or in-out argument")

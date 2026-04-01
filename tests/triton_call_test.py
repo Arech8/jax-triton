@@ -670,7 +670,7 @@ class TritonKernelCallTest(parameterized.TestCase):
       n_elements,
       out_ptr,
       BLOCK_SIZE: tl.constexpr,
-      CLEANUP: tl.constexpr = False,
+      CLEANUP: tl.constexpr = False,  # this also implicitly test defaults
     ):
       pid = tl.program_id(axis=0)
       block_start = pid * BLOCK_SIZE
