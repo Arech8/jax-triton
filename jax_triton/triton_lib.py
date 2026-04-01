@@ -572,12 +572,6 @@ class JTJITFunction:
     kernel's signature."""
     return {name: index for index, name in enumerate(self.arg_names)}
 
-  @cached_property
-  def index_to_arg_name(self) -> dict[int, str]:
-    """Returns a dictionary mapping a kernel parameter index in the kernel's signature
-    to its name."""
-    return dict(enumerate(self.arg_names))
-
   @property  # it's needed only for compiling once, so it's better have this like that
   def params(self) -> list[triton.runtime.jit.KernelParam]:
     return self.fn.params
@@ -948,11 +942,8 @@ def make_kernel_params(
 
     kernel_params.append(
       dict(
-        # metaparams=tuple(sorted(config_metaparams.items())),
-        # metaparams=tuple(config_metaparams.items()),  # why do they must be flattened?
         metaparams=config_metaparams,
         grid=config_grid,
-        # zeroed_params_with_sizes=tuple(zeroed_params_with_sizes.items()),  # and these?
         zeroed_params_with_sizes=zeroed_params_with_sizes,
       )
     )
@@ -975,7 +966,7 @@ def add_output_args(
   )
   # it's a dict mapping out-spec -> possibly nested structure of 1 or many JTArrays
 
-  idx2name = jtfu.index_to_arg_name
+  idx2name = jtfu.arg_names
   for out_spec, arrays in outputs.items():
     assert isinstance(out_spec, tuple)
     top_idx = out_spec[0]
@@ -1004,22 +995,12 @@ def triton_kernel_call_lowering(
   out_shapes,
   grid,
   compute_capability,
-  # input_output_aliases,
   operand_output_aliases,
   zeroed_outputs,
   serialized_metadata,
   args_kwargs,
   out_info,
 ):
-  # input_output_aliases are used for:
-  # 1. enhance `args/kwargs` for Triton to contain output-only arguments. Also requires
-  #   output_shapes description (or more precisely, its compound structure), and
-  #   output_names. All for output args only, filtered from the original `out_shape`
-  #   with input_output_aliases.
-  # 2. providing additional buffers to zero when JAX's launcher is called.
-  # 3. provide a raw index mapping from inputs to outputs for the backend
-  # assert isinstance(input_output_aliases, tuple), "input_output_aliases must be a tuple"
-  # input_output_aliases = dict[int, int](input_output_aliases)
   operand_output_aliases = dict[int, int](operand_output_aliases)
 
   jtfu = JTJITFunction(fn)
@@ -1058,7 +1039,6 @@ def triton_kernel_call_lowering(
     configs = make_configs_from_heuristics(fn, configs, kwargs, named_args)
     fn = fn.fn
 
-  # TODO make_kernel_params might be a method of JTJITFunction
   kernel_params = make_kernel_params(
     ctx,
     len(abstract_args),
@@ -1075,18 +1055,15 @@ def triton_kernel_call_lowering(
       ctx.module_context.platforms[0],
       args,
       compute_capability=compute_capability,
-      # kwargs=dict(params["metaparams"]),
       kwargs=params["metaparams"],
     )
 
     call_params = []
-    # zeroed_params_with_sizes = dict(params["zeroed_params_with_sizes"])
     zeroed_params_with_sizes = params["zeroed_params_with_sizes"]
     array_idx = 0
 
     for path, arg in non_constexprs.items():
       if isinstance(arg, JTArray):
-        # assert len(path) == 1, "complex paths are not supported yet"
         arg_attrs = specialization_attr[path]
         call_params.append(
           triton_kernel_call_lib.create_array_parameter(
@@ -1131,10 +1108,10 @@ def triton_kernel_call_lowering(
     kernel_call = kernel_calls[0]
 
   call_proto = kernel_call.to_proto(kernel_call_name, serialized_metadata)
-  # TODO: operand_output_aliases parameter is a raw positional index into those operands
-  # that are seen by MLIR custom_call(). Scalars in JAX-Triton are embedded into
-  # `backend_config`/`call_proto` and aren't passed as MLIR operands, hence indices of
-  # `operand_output_aliases` count only arrays among all inputs.
+  # Note, `operand_output_aliases` parameter uses raw positional indices into the
+  # operands that are seen by MLIR custom_call(). Scalars in JAX-Triton are embedded
+  # into `backend_config`/`call_proto` and aren't passed as MLIR operands, hence indices
+  # of `operand_output_aliases` count only arrays among all inputs.
   rule = jax.ffi.ffi_lowering(
     custom_call_target_name,
     api_version=2,
@@ -1448,7 +1425,7 @@ def make_aliased_shapes(
     in_spec = [in_spec]
 
   name2idx = jtfu.arg_name_to_index
-  idx2name = jtfu.index_to_arg_name
+  idx2name = jtfu.arg_names
   aliases = {}
 
   def _make_aliased(elm: Any, shapes: list[jax.ShapeDtypeStruct]) -> None:
@@ -1553,7 +1530,7 @@ def canonicalize_out_shape(
     )
 
   if isinstance(out_shape, dict):
-    # dictionary form doesn't have info on aliased buffers
+    # The dictionary form doesn't have info on aliased buffers
     if out_names is None:
       out_names = tuple(out_shape.keys())
     else:
@@ -1597,7 +1574,6 @@ def canonicalize_out_shape(
   pure_out_shapes: dict[CanonicalKernelArgPath, Sequence[jax.ShapeDtypeStruct]] = {}
   name2idx = jtfu.arg_name_to_index
   for i, outn in enumerate(out_names):
-    # ospec = _canonicalize_out_spec_element(outn, i, out_values, name2idx)
     ospec = _canonicalize_out_spec_element(outn, name2idx)
     pure_out_shapes[ospec] = out_values[i]
   # ordering of pure_out_shapes elements reflects ordering of parameters in the kernel's
@@ -1613,11 +1589,8 @@ def canonicalize_out_shape(
   return pure_out_shapes, aliased_shapes
 
 
-# TODO if this impl is fine and not needed anywhere else, perhaps inline it
 def _canonicalize_out_spec_element(
   elm: InOutSpec,
-  # elm_idx: int,
-  # out_shapes: Sequence[jax.ShapeDtypeStruct],
   name2idx: dict[str, int],
 ) -> CanonicalKernelArgPath:
   orig_name = None
@@ -1724,9 +1697,11 @@ def triton_call(
       implicitly (user do not need to pass them explicitly). In the kernel signature,
       purely output parameters should be after the last input parameter to be passed as
       a positional argument to `triton_call()`.
+
     kernel: A Triton (e.g. a function decorated with `triton.jit`) or a Gluon kernel.
       All static values should be annotated with `triton.language.constexpr` or
       `triton.experimental.gluon.language.constexpr`.
+
     out_shape: a description of shapes and dtypes of output parameters of the kernel.
       Could be one of the following:
       (1) a single ShapeDtype-like object (something that has `.shape` and
@@ -1769,17 +1744,20 @@ def triton_call(
       of `args` or `kwargs`, - these arguments are added implicitly by the launcher. If
       an argument is going to be an input-output argument, set `input_output_aliases`
       accordingly.
+
     out_names: an ordered sequence of output parameter names.
       This is another way to specify the output parameter names of the kernel. This one
       is useful to employ in conjunction with the @kernel decorator.
       If `out_shape` is a dictionary, its keys must be in sync with `out_names` and
       `out_names` ordering takes precedence over the `out_shape` ordering.
+
     grid: An integer, tuple of up to 3 integers, or a function that returns a
       tuple of up to 3 integers. When `grid` is an integer, `kernel` is
       invocated in `grid`-many parallel executions. When `grid` is a sequence of
       integers, `kernel` is launched in a `prod(grid)`-many parallel execution.
       When `grid` is a function, it is passed `**kwargs` and should return a
       tuple of up to 3 integers.
+
     input_output_aliases: tells JAX/XLA backend which input arguments not only supply
       input data to the kernel, but also serve as output buffers (hence requiring the
       backend to arrange not only `host->device` data copying before kernel launch, but
@@ -1791,16 +1769,16 @@ def triton_call(
       Interleaving output with in/out argument shapes in `out_shape` isn't supported.
       User is responsible for adhering to the requirement.
 
-      Note, this might be a BREAKING change, since originally indices referenced arrays
-      in inputs only. Now indices are essentially an :in-spec: to :out-spec: mapping,
-      so they reference parameters in the kernel's signature coordinate space.
+      Note, this might be a BREAKING change, since originally indices in keys counted
+      only arrays in inputs. Now indices are essentially an :in-spec: to :out-spec:
+      mapping, so they reference parameters in the kernel's signature coordinate space.
 
-      (2 - recommended): a non-dictionary form expands to an ordered, potentially
-      nested, sequence of input array coordinates in the kernel's signature coordinate
-      space. For this form there should be no corresponding output arguments in the
-      `out_shape`. Shapes and dtypes are inferred from referenced input arguments
-      automatically (JAX/XLA doesn't support typecasting of aliased buffers anyway, so
-      `out_shape` for aliased buffers are always redundant). This could be specifically:
+      (2 - recommended): an ordered, potentially nested, sequence of input array
+      coordinates in the kernel's signature coordinate space. When this form is used
+      there should be no corresponding output arguments in the `out_shape`. Shapes and
+      dtypes are inferred from referenced input arguments automatically (JAX/XLA doesn't
+      support typecasting of aliased buffers anyway, so `out_shape` for aliased buffers
+      are always redundant). This could be specifically:
       - a single int, or a string, or a tuple having an int or a string as a first
         element: describes an input array in the kernel's signature coordinate space.
       - a list: ordered, possibly nested, sequence of the above. The nested structure of
@@ -1830,6 +1808,7 @@ def triton_call(
       updates), you should designate a purely output argument for it with a proper
       `out_shape` specification, and mention the buffer coordinate in `out_shape` in
       `zeroed_outputs` parameter.
+
     zeroed_outputs: A sequence of `out_shape` coordinates, or a function returning a
       sequence of such coordinates, for outputs that should be zeroed before the kernel
       is launched.
@@ -1844,6 +1823,7 @@ def triton_call(
       purely output argument above, so if you need the kernel to start working with a
       buffer from a definite zeroed state, just declare the buffer as a purely output
       argument in `out_shape` and mention the buffer's coordinate in `zeroed_outputs`.
+
     num_warps: The number of warps used to execute the Triton kernel.
     num_stages: The number of stages emitted by the Triton compiler.
     num_ctas: The size of thread blocks per cluster to be used on GPUs with
@@ -1853,6 +1833,7 @@ def triton_call(
       the backend options argument.
     serialized_metadata: Arbitrary metadata that will be added into the
       serialized kernel call.
+
     kwargs: Key-value pairs (num_warps, num_stages, num_ctas, debug and enable_fp_fusion
       arguments are added there automatically) that will be provided to:
       - a `grid` (if it is a function),
