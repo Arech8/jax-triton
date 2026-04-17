@@ -156,6 +156,29 @@ def to_python_type(arg: Any) -> Any:
   return arg
 
 
+# Module-level helpers used on the kernel launch hot path. Keeping them at module level
+# avoids recreating closures/classes on every triton_call() invocation.
+def _is_none_leaf(x):
+  return x is None
+
+
+def _contain_arrays(v):
+  """Returns True if `v` is a jax.Array or a (possibly nested) tuple containing one."""
+  if isinstance(v, jax.Array):
+    return True
+  if isinstance(v, tuple):
+    return any(_contain_arrays(x) for x in v)
+  return False
+
+
+def _to_shape_dtype_struct(a):
+  return jax.ShapeDtypeStruct(a.shape, a.dtype)
+
+
+# A unique sentinel to distinguish a missing dict lookup from a legitimate None value.
+_MISSING = object()
+
+
 def normalize_grid(grid: GridOrLambda, metaparams) -> tuple[int, int, int]:
   if callable(grid):
     grid = grid(metaparams)
@@ -375,10 +398,24 @@ def compile_ttir_to_hsaco_inplace(
   )
 
 
+# Cache of (gpu_target, backend, resolved_compute_capability) keyed by
+# (make_gpu_target_func, compute_capability). Building a Triton backend from a GPUTarget
+# is expensive (imports, dialect loading, options parsing setup) and under the JAX
+# single-device assumption it's safe to reuse the same instances across kernel launches.
+_BACKEND_CACHE: dict[
+  tuple[Any, int | None], tuple[Any, Any, int]
+] = {}
+
+
 def make_backend(
   make_gpu_target_func, compute_capability: int | None, num_ctas: int
 ) -> tuple[triton.compiler.BaseBackend, triton.compiler.GPUTarget, int]:
-  """Resolves compute_capability and spawns triton's Backend and GPUTarget objects"""
+  """Resolves compute_capability and spawns triton's Backend and GPUTarget objects.
+
+  Results are cached per (make_gpu_target_func, compute_capability) pair. `num_ctas`
+  only participates in input validation; it's intentionally excluded from the cache
+  key as it doesn't affect the returned backend/target objects.
+  """
 
   # TODO(sharadmv): handle multiple devices, right now we assume device 0
   # which is fine when we have multiple of the same GPU but this won't work in
@@ -386,6 +423,14 @@ def make_backend(
   # `self.device_caches = defaultdict(self.create_binder)` -- it spawns a new set of
   # precomputes for each new device with `x,y,.. = self.device_caches[device]` using the
   # create_binder() factory function.
+  cache_key = (make_gpu_target_func, compute_capability)
+  cached = _BACKEND_CACHE.get(cache_key)
+  if cached is not None:
+    backend, gpu_target, resolved_cc = cached
+    if num_ctas > 1 and resolved_cc < 90:
+      raise ValueError("num_ctas > 1 unsupported before Hopper.")
+    return backend, gpu_target, resolved_cc
+
   device = 0
   if compute_capability is None:
     compute_capability = triton_kernel_call_lib.get_compute_capability(device)
@@ -395,6 +440,7 @@ def make_backend(
   gpu_target = make_gpu_target_func(device, compute_capability)
   backend = triton.compiler.make_backend(gpu_target)
 
+  _BACKEND_CACHE[cache_key] = (backend, gpu_target, compute_capability)
   return backend, gpu_target, compute_capability
 
 
@@ -531,6 +577,49 @@ class JTJITFunction:
   JTJITFunction object will have a proper lifetime.
   """
 
+  def __new__(
+    cls,
+    fn: autotuner.Heuristics
+    | autotuner.Autotuner
+    | triton.JITFunction
+    | gl_runtime.GluonJITFunction,
+  ):
+    # Fast path: already a JTJITFunction — return it unchanged.
+    if isinstance(fn, JTJITFunction):
+      return fn
+
+    # Peel wrappers to find the inner Triton JITFunction/GluonJITFunction, which is
+    # where we cache the JTJITFunction instance. All cached_property values on
+    # JTJITFunction (arg_names, arg_name_to_index, ...) are preserved across calls as
+    # long as the same instance is reused for the same kernel.
+    inner = fn
+    if isinstance(inner, JTKernel):
+      inner = inner.kernel
+    if isinstance(inner, autotuner.Autotuner):
+      inner = inner.fn
+    if isinstance(inner, autotuner.Heuristics):
+      inner = inner.fn
+
+    if not isinstance(inner, (triton.JITFunction, gl_runtime.GluonJITFunction)):
+      raise ValueError(
+        "`kernel` must be a Triton's `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner` object."
+      )
+
+    cached = getattr(inner, "_jT_jtfu", None)
+    if cached is not None:
+      return cached
+
+    instance = super().__new__(cls)
+    instance.fn = inner
+    # Best-effort caching: if setattr fails (e.g. object has __slots__) we silently
+    # fall back to recreating JTJITFunction on every call. Triton's JITFunction is
+    # attribute-settable so this is effectively always taken.
+    try:
+      inner._jT_jtfu = instance
+    except (AttributeError, TypeError):
+      pass
+    return instance
+
   def __init__(
     self,
     fn: autotuner.Heuristics
@@ -538,21 +627,10 @@ class JTJITFunction:
     | triton.JITFunction
     | gl_runtime.GluonJITFunction,
   ):
-    # peel off wrappers to get to the JITFunction object
-    if isinstance(fn, JTKernel):
-      fn = fn.kernel
-    if isinstance(fn, JTJITFunction):
-      fn = fn.fn
-    if isinstance(fn, autotuner.Autotuner):
-      fn = fn.fn
-    if isinstance(fn, autotuner.Heuristics):
-      fn = fn.fn
-
-    if not isinstance(fn, (triton.JITFunction, gl_runtime.GluonJITFunction)):
-      raise ValueError(
-        "`kernel` must be a Triton's `JITFunction`, `GluonJITFunction`, `Heuristics` or `Autotuner` object."
-      )
-    self.fn = fn
+    # __init__ is intentionally a no-op: __new__ fully constructs the instance (or
+    # returns a cached one), so re-running the peeling logic here would needlessly
+    # burn cycles on every kernel launch.
+    pass
 
   @cached_property
   def arg_names(self) -> list[str]:
@@ -1285,7 +1363,7 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   # holds in the upstream Triton too (small arrays could be passed as tuples/lists
   # though to constexpr annotated params).
 
-  flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=lambda x: x is None)
+  flat_args, args_tree = tree_util.tree_flatten(args, is_leaf=_is_none_leaf)
   # We must let Nones to pass through flattening and `is_leaf` semantic is additive.
 
   # Since there's usually much more non-vector parameters than vectors, extract
@@ -1295,14 +1373,24 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   # by the check. However, there's no use-case where we might want to pass a scalar as a
   # traceable thing into the kernel call, so we can safely assume a user will mark it as
   # a static argument for jitting (the old implementation relied on that too).
-  abs_args = {i: v for i, v in enumerate(flat_args) if isinstance(v, jax.Array)}
-  # counting raw arrays to build `operand_output_aliases` mapping
-  array_id2idx = {id(v): idx for idx, v in enumerate(abs_args.values())}
-  # Note that we assume user won't pass the same array several times in args or in
-  # kwargs AND would want to alias it, so not checking this here and below
-
-  static_args = (to_python_type(v) for v in flat_args if not isinstance(v, jax.Array))
-  # we're going to pass flat_args as static params now. There's a caveat at least for
+  #
+  # Single-pass classification of flat_args into arrays vs static values. Compared to
+  # running three separate comprehensions (abs_args dict, array_id2idx dict, static_args
+  # generator) this pays a single iteration over flat_args which matters on the hot path
+  # when it's called on every unjitted kernel launch. The resulting data structures have
+  # the same semantics as the original implementation.
+  abs_args_keys = []
+  abs_args_values = []
+  static_args = []
+  array_id2idx = {}
+  for i, v in enumerate(flat_args):
+    if isinstance(v, jax.Array):
+      array_id2idx[id(v)] = len(abs_args_values)
+      abs_args_keys.append(i)
+      abs_args_values.append(v)
+    else:
+      static_args.append(to_python_type(v))
+  # We're going to pass static_args as static params now. There's a caveat at least for
   # tl.constexpr() objects: JAX's lowering code seems to require only hashability
   # and correct equality semantics for static objects, and this is true for
   # tl.constexpr() with a nuance: on comparison it returns not a bool True/False, but
@@ -1310,43 +1398,43 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
   # that the `(a==b) is True`, or `type(a==b) is bool` - it'll break.
 
   # Now do the same for kwargs with a caveat - we must traverse them in order of kernel
-  # parameters declaration to ensure arrays ends up in a correct order
-  def contain_arrays(v):
-    if isinstance(v, jax.Array):
-      return True
-    elif isinstance(v, tuple):  # among pytrees only tuples could be passed as arguments
-      return any(contain_arrays(x) for x in v)
-    return False
-
-  class _FakeVal: ...
-
+  # parameters declaration to ensure arrays ends up in a correct order.
+  # We pay the iteration over jtfu.arg_names only when there's an overlap between kwargs
+  # and kernel parameter names; otherwise this inner loop is entirely avoided. That's a
+  # common case in practice - most kernels are called with all arguments positional.
   abs_kwargs_list = []  # only values to abstract
-  abs_kwargs_meta = {}  # hashable reconstruction info, keyed by a parameter name
-  idx_offset = len(array_id2idx)
+  abs_kwargs_meta_items = []  # hashable reconstruction info, (param_name, meta)
   # iterating over param names ensures correct serialization ordering
+  kwargs_get = kwargs.get  # local binding is faster in a hot loop
   for aname in jtfu.arg_names:
     # if kwargs has that parameter AND the value contains an array somewhere (including
     # nested tuples/lists), we handle the whole arg value differently to be able to
     # reconstruct it correctly. Otherwise we just skip the arg to pass it along with
     # other kwargs, such as backend options.
-    arg_val = kwargs.get(aname, _FakeVal())
-    if contain_arrays(arg_val):
-      del kwargs[aname]  # handle the value differently
-      if isinstance(arg_val, jax.Array):  # shortcutting if the value is a raw array
-        abs_kwargs_list.append(arg_val)
-        abs_kwargs_meta[aname] = None
-        array_id2idx[id(arg_val)] = idx_offset
-        idx_offset += 1
-      else:  # do full flattening
-        flat_v, the_tree = tree_util.tree_flatten(arg_val)
-        abs_v = {i: v for i, v in enumerate(flat_v) if isinstance(v, jax.Array)}
-        array_id2idx.update(
-          (id(v), idx + idx_offset) for idx, v in enumerate(abs_v.values())
-        )
-        idx_offset += len(abs_v)
-        static_v = (to_python_type(v) for v in flat_v if not isinstance(v, jax.Array))
-        abs_kwargs_list.extend(abs_v.values())
-        abs_kwargs_meta[aname] = (tuple(static_v), tuple(abs_v.keys()), the_tree)
+    arg_val = kwargs_get(aname, _MISSING)
+    if arg_val is _MISSING or not _contain_arrays(arg_val):
+      continue
+    del kwargs[aname]  # handle the value differently
+    if isinstance(arg_val, jax.Array):  # shortcutting if the value is a raw array
+      array_id2idx[id(arg_val)] = len(array_id2idx)
+      abs_kwargs_list.append(arg_val)
+      abs_kwargs_meta_items.append((aname, None))
+    else:  # do full flattening
+      flat_v, the_tree = tree_util.tree_flatten(arg_val)
+      abs_v_keys = []
+      abs_v_values = []
+      static_v = []
+      for i, v in enumerate(flat_v):
+        if isinstance(v, jax.Array):
+          array_id2idx[id(v)] = len(array_id2idx)
+          abs_v_keys.append(i)
+          abs_v_values.append(v)
+        else:
+          static_v.append(to_python_type(v))
+      abs_kwargs_list.extend(abs_v_values)
+      abs_kwargs_meta_items.append(
+        (aname, (tuple(static_v), tuple(abs_v_keys), the_tree))
+      )
 
   # Primitive's bind() doesn't support passing unhashable values as key-value arguments,
   # however, kwargs might also contain backend options, and some of them are dicts. So
@@ -1359,15 +1447,15 @@ def serialize_args_kwargs(jtfu: JTJITFunction, args: list, kwargs: dict):
     kwargs["extern_libs"] = tuple(kwargs["extern_libs"].items())
 
   return (
-    abs_args.values(),  # intentionally not materialized
+    abs_args_values,
     abs_kwargs_list,
     array_id2idx,  # mapping: array id -> flat array index
     (  # first go args info
       args_tree,  # structure of args
-      tuple(abs_args.keys()),  # array positions in args
+      tuple(abs_args_keys),  # array positions in args
       tuple(static_args),  # leftover args after arrays removed
       # then kwargs info
-      tuple(abs_kwargs_meta.items()),
+      tuple(abs_kwargs_meta_items),
       tuple(kwargs.items()),  # leftover kwargs
     ),
   )
@@ -1657,12 +1745,9 @@ def canonicalize_out_shape(
       raise ValueError("out_shape specification mismatches out_names")
   # no use of out_shape below this line
 
-  def _to_ShapeDtypeStruct(a: Any) -> jax.ShapeDtypeStruct:
-    return jax.ShapeDtypeStruct(a.shape, a.dtype)
-
   if aliased_shapes:
-    aliased_shapes = tree_util.tree_map(_to_ShapeDtypeStruct, aliased_shapes)
-  out_values = tree_util.tree_map(_to_ShapeDtypeStruct, out_values)
+    aliased_shapes = tree_util.tree_map(_to_shape_dtype_struct, aliased_shapes)
+  out_values = tree_util.tree_map(_to_shape_dtype_struct, out_values)
 
   # now finally canonicalizing out_names using the out_values.
   pure_out_shapes: dict[CanonicalKernelArgPath, Sequence[jax.ShapeDtypeStruct]] = {}
@@ -2022,16 +2107,24 @@ def triton_call(
 
   pure_out_shapes_flat, pure_out_tree = tree_util.tree_flatten(pure_out_shapes)
   num_pure_outputs = len(pure_out_shapes_flat)
-
   aliased_shapes_flat, aliased_tree = tree_util.tree_flatten(aliased_shapes)
-  aliased_shape_id2idx = {  # shape id -> raw output array idx
-    id(s): i + num_pure_outputs for i, s in enumerate(aliased_shapes_flat)
-  }
-  operand_output_aliases = {
-    array_id2idx[arr_id]: aliased_shape_id2idx[shp_id]
-    for arr_id, shp_id in aliases.items()
-  }
   num_aliased_outputs = len(aliased_shapes_flat)
+
+  # Fast path for the common no-aliasing case (`aliases` empty implies
+  # `aliased_shapes_flat` empty here, see the ValueError check above): skip the two dict
+  # comprehensions that would otherwise run for every single kernel launch.
+  if aliases:
+    aliased_shape_id2idx = {  # shape id -> raw output array idx
+      id(s): i + num_pure_outputs for i, s in enumerate(aliased_shapes_flat)
+    }
+    operand_output_aliases_items = tuple(
+      (array_id2idx[arr_id], aliased_shape_id2idx[shp_id])
+      for arr_id, shp_id in aliases.items()
+    )
+    out_shapes = tuple(pure_out_shapes_flat) + tuple(aliased_shapes_flat)
+  else:
+    operand_output_aliases_items = ()
+    out_shapes = tuple(pure_out_shapes_flat)
 
   if num_pure_outputs + num_aliased_outputs == 0:
     raise ValueError(
@@ -2046,10 +2139,10 @@ def triton_call(
     custom_call_target_name=custom_call_target_name,
     # out_shapes must be a flat sequence of shapes of ALL arrays whose result must be
     # returned, i.e. output + input-output=aliased arrays.
-    out_shapes=tuple(pure_out_shapes_flat) + tuple(aliased_shapes_flat),
+    out_shapes=out_shapes,
     grid=grid,
     compute_capability=compute_capability,
-    operand_output_aliases=tuple(operand_output_aliases.items()),
+    operand_output_aliases=operand_output_aliases_items,
     zeroed_outputs=zeroed_outputs,
     serialized_metadata=serialized_metadata,
     args_kwargs=args_kwargs_meta,
