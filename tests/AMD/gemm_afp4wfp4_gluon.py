@@ -593,9 +593,7 @@ def gemm_afp4wfp4(
     input_output_aliases={2: 0},
     out_shape=jax.ShapeDtypeStruct(shape=out_tensor_y.shape, dtype=out_tensor_y.dtype),
     grid=grid,
-    num_warps=config["num_warps"],
-    num_stages=config["num_stages"],
-    metaparams=config,
+    **config,
   )
 
   if unit_NUM_KSPLIT:
