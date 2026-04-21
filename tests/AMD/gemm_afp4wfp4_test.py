@@ -28,24 +28,25 @@ def generate_gemm_afp4wfp4_inputs(
 ):
   assert not isinstance(dtype, str)
 
-  def randint(key, shape, min, max, dtype):
+  def randint(key, shape, min, max, dtype, transpose=False):
     key, k = random.split(key)
-    return key, random.randint(k, shape, min, max, dtype=dtype)
+    r = random.randint(k, shape if not transpose else shape[::-1], min, max, dtype=dtype)
+    return key, r
 
   if layout[0] == "T":
     # 34 is two packed e2m1 values 0010 which is 1.0.
     key, x_low = randint(key, (M, K // 2), 0, 16, dtype=jnp.uint8)
     key, x_high = randint(key, (M, K // 2), 0, 16, dtype=jnp.uint8)
   else:
-    key, x_low = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8).T
-    key, x_high = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8).T
+    key, x_low = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8, transpose=True)
+    key, x_high = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8, transpose=True)
 
   if layout[1] == "N":
     key, w_low = randint(key, (N, K // 2), 0, 16, dtype=jnp.uint8)
     key, w_high = randint(key, (N, K // 2), 0, 16, dtype=jnp.uint8)
   else:
-    key, w_low = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8).T
-    key, w_high = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8).T
+    key, w_low = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8, transpose=True)
+    key, w_high = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8, transpose=True)
 
   # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
   x = x_high << 4 | x_low

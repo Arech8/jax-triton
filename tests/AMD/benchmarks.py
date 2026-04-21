@@ -266,30 +266,16 @@ class CacheFlusher:
       jax.block_until_ready(o)
 
 
-def run_benchmarks(
-  enabled: list[str] | None = None,
-  *,
-  iters: int = 100,
-  reps: int = 10,
-  warmup: int = 3,
-  single_gemm: bool = False,
-  random_inputs: bool = True,
-  randomize_iterations: bool = True,
-  export_path_pfx: str | None = None,
-  clear_cache: bool = True,
-  batch_functions: bool = False,
-  pvalue_stats_bootstrap: int = 1000,
-):
+def run_benchmarks(args: argparse.Namespace):
   global _single_gemm, _random_inputs
-  _single_gemm = single_gemm
-  _random_inputs = random_inputs
+  _single_gemm = args.single_gemm
+  _random_inputs = args.random_inputs
 
   start = time.perf_counter_ns()
 
-  if not enabled:
-    enabled = qb.getRegisteredBenchmarkSetNames()
+  benchmark_sets = args.benchmark_sets or qb.getRegisteredBenchmarkSetNames()
 
-  if clear_cache:
+  if args.clear_cache:
     print("Will flush L2 cache before each run")
     cache_flusher = CacheFlusher()
 
@@ -302,16 +288,16 @@ def run_benchmarks(
     def clear_l2(inputs):
       pass
 
-  if export_path_pfx:
-    enabled_str = "-".join(enabled)
+  if args.export_path_pfx:
+    enabled_str = "-".join(benchmark_sets)
     fname_base = (
-      f"{export_path_pfx}_{enabled_str}"
-      f"_i{iters}_r{reps}"
-      + ("_SG" if single_gemm else "")
-      + ("" if random_inputs else "_NrI")
-      + ("" if randomize_iterations else "_NrIT")
-      + ("" if clear_cache else "_NCC")
-      + ("_BF" if batch_functions else "")
+      f"{args.export_path_pfx}_{enabled_str}"
+      f"_i{args.iters}_r{args.reps}"
+      + ("_SG" if args.single_gemm else "")
+      + ("" if args.random_inputs else "_NrI")
+      + ("" if args.randomize_iterations else "_NrIT")
+      + ("" if args.clear_cache else "_NCC")
+      + ("_BF" if args.batch_functions else "")
       + "_"
     )
     c = 0
@@ -328,7 +314,7 @@ def run_benchmarks(
     fname_base = None
     console = LoggingConsole()
 
-  bms = qb.getRegisteredBenchmarks(enabled)
+  bms = qb.getRegisteredBenchmarks(benchmark_sets)
   assert len(bms) > 0, "No benchmark sets were enabled, shouildn't be here"
 
   bm_names = tuple(bms.keys())
@@ -345,19 +331,19 @@ def run_benchmarks(
   # related overhead, so time.perf_counter_ns() used there is appropriate
   _, results = qb.benchmark(
     bms.values(),
-    iters=iters,
-    reps=reps,
-    warmup=warmup,
-    randomize_iterations=randomize_iterations,
-    batch_functions=batch_functions,
+    iters=args.iters,
+    reps=args.reps,
+    warmup=args.warmup,
+    randomize_iterations=args.randomize_iterations,
+    batch_functions=args.batch_functions,
     wait_complete=jax.block_until_ready,
     clear_cache=clear_l2,
-    show_progress_each=1 if batch_functions else 10,
+    show_progress_each=1 if args.batch_functions else 10,
     bm_names=bm_names,
     alt_delimiter="|",
     metrics={"mean": np.mean, "median": np.median, "min": np.min},
     console=console,
-    pvalue_stats_bootstrap=pvalue_stats_bootstrap,
+    pvalue_stats_bootstrap=args.pvalue_stats_bootstrap,
   )
 
   end = time.perf_counter_ns()
@@ -406,19 +392,7 @@ def main():
   )
 
   args = parser.parse_args()
-  run_benchmarks(
-    enabled=args.benchmark_sets or None,
-    iters=args.iters,
-    reps=args.reps,
-    warmup=args.warmup,
-    batch_functions=args.batch_functions,
-    randomize_iterations=args.randomize_iterations,
-    export_path_pfx=args.export_path_pfx,
-    single_gemm=args.single_gemm,
-    random_inputs=args.random_inputs,
-    clear_cache=args.clear_cache,
-    pvalue_stats_bootstrap=args.pvalue_stats_bootstrap,
-  )
+  run_benchmarks(args)
 
 
 if __name__ == "__main__":
