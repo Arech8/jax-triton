@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import copy
-import dataclasses
 import functools
 from functools import cached_property
 import inspect
@@ -42,7 +41,7 @@ import numpy as np
 
 import triton
 from triton.compiler import compiler as tc
-# import triton.language as tl
+
 from triton.runtime import autotuner
 import triton.runtime.jit as triton_runtime_jit
 import triton._C.libtriton as _triton
@@ -79,23 +78,23 @@ InOutSpec = int | str | tuple[int | str | KernelArgPath, ...]
 _TMEM_MAX_SIZE = 512
 
 _JAX_TO_TRITON_TYPE_MAP = {
-    jnp.dtype("bfloat16"): "bf16",
-    jnp.dtype("float64"): "fp64",
-    jnp.dtype("float32"): "fp32",
-    jnp.dtype("float16"): "fp16",
-    jnp.dtype("float8_e4m3fn"): "fp8e4nv",
-    jnp.dtype("float8_e5m2"): "fp8e5",
-    jnp.dtype("float8_e4m3fnuz"): "fp8e4b8",
-    jnp.dtype("float8_e5m2fnuz"): "fp8e5b16",
-    jnp.dtype("int64"): "i64",
-    jnp.dtype("int32"): "i32",
-    jnp.dtype("int16"): "i16",
-    jnp.dtype("int8"): "i8",
-    jnp.dtype("uint64"): "u64",
-    jnp.dtype("uint32"): "u32",
-    jnp.dtype("uint16"): "u16",
-    jnp.dtype("uint8"): "u8",
-    jnp.dtype("bool"): "i1",
+  jnp.dtype("bfloat16"): "bf16",
+  jnp.dtype("float64"): "fp64",
+  jnp.dtype("float32"): "fp32",
+  jnp.dtype("float16"): "fp16",
+  jnp.dtype("float8_e4m3fn"): "fp8e4nv",
+  jnp.dtype("float8_e5m2"): "fp8e5",
+  jnp.dtype("float8_e4m3fnuz"): "fp8e4b8",
+  jnp.dtype("float8_e5m2fnuz"): "fp8e5b16",
+  jnp.dtype("int64"): "i64",
+  jnp.dtype("int32"): "i32",
+  jnp.dtype("int16"): "i16",
+  jnp.dtype("int8"): "i8",
+  jnp.dtype("uint64"): "u64",
+  jnp.dtype("uint32"): "u32",
+  jnp.dtype("uint16"): "u16",
+  jnp.dtype("uint8"): "u8",
+  jnp.dtype("bool"): "i1",
 }
 
 
@@ -173,7 +172,7 @@ def avals_to_layouts(avals):
 triton_kernel_call_p = jex.core.Primitive("triton_kernel_call")
 triton_kernel_call_p.multiple_results = True
 triton_kernel_call_p.def_impl(
-    functools.partial(xla.apply_primitive, triton_kernel_call_p)
+  functools.partial(xla.apply_primitive, triton_kernel_call_p)
 )
 
 
@@ -193,6 +192,8 @@ def make_gpu_target_cuda(device, compute_capability):
 
 
 _IS_HIPBackend_PATCHED = False
+
+
 def _patch_hip_backend():
   """
   This fixes unconditional and totally unnecessary "import torch" in Triton's
@@ -233,146 +234,96 @@ def make_gpu_target_hip(device, compute_capability):
   return hb.GPUTarget("hip", arch, 64)
 
 
-@dataclasses.dataclass
 class CompilationResult:
-  binary: str
-  name: str
-  shared_mem_bytes: int
-  ttgir: str | None
-  llir: str | None
+  def __init__(
+    self,
+    src: tc.ASTSource | gl_runtime.GluonASTSource,
+    module,
+    gpu_target: cb.GPUTarget | hb.GPUTarget,
+    backend: cb.CUDABackend | hb.HIPBackend,
+    options: cb.CUDAOptions | hb.HIPOptions,
+    platform: str,
+  ):
+    # We don't need special `compute_capability` instance here, since Triton stores it
+    # in a gpu_target object and NVIDIA's backend uses it to properly set options.arch
+    # in the backend.parse_options(), which instantiates the options object.
 
+    is_cuda = platform == "cuda"
+    is_rocm = platform == "rocm"
 
-def compile_ttir_inplace(
-    ttir,
-    backend: [cb.CUDABackend | hb.HIPBackend],
-    options: [cb.CUDAOptions | hb.HIPOptions],
-    compute_capability,
-    platform,
-):
-  if platform == "cuda":
-    return compile_ttir_to_ptx_inplace(
-        ttir,
-        backend,
-        options,
-        compute_capability,
-    )
+    debug = options.debug
+    if debug:
+      print("Compilation, initial module:", module)
 
-  elif platform == "rocm":
-    return compile_ttir_to_hsaco_inplace(
-        ttir,
-        backend,
-        options,
-        compute_capability,
-    )
-  else:
-    raise ValueError("Unsupported device.")
+    metadata = {
+      "target": gpu_target,
+      **options.__dict__,
+      "triton_version": triton.__version__,
+    }
 
+    stages = {}
+    backend.add_stages(stages, options, src.language)
 
-def compile_ttir_to_ptx_inplace(
-    ttir,
-    cuda_backend: cb.CUDABackend,
-    cuda_options: cb.CUDAOptions,
-    compute_capability,
-) -> CompilationResult:
-  if cuda_options.debug:
-    print(ttir)
-  try:
-    metadata = {}
-    opt_ttir = cuda_backend.make_ttir(ttir, metadata, cuda_options, compute_capability)
-    ttgir = cuda_backend.make_ttgir(
-        opt_ttir,
-        metadata,
-        cuda_options,
-        compute_capability,
-    )
-  except RuntimeError as e:
-    ttir.dump()
-    raise ValueError("TTIR->TTGIR pass failed!") from e
-  if cuda_options.debug:
-    print(ttgir)
-  try:
-    llir = cuda_backend.make_llir(
-        ttgir,
-        metadata,
-        cuda_options,
-        compute_capability,
-    )
-  except RuntimeError as e:
-    ttgir.dump()
-    raise ValueError("TTGIR->LLIR pass failed!") from e
-  if metadata["tmem_size"] > _TMEM_MAX_SIZE:
-    raise ValueError(
-        f"TMEM size {metadata['tmem_size']} exceeds limit {_TMEM_MAX_SIZE}."
-    )
-  shared_mem_bytes = metadata["shared"]
-  if cuda_options.debug:
-    print(llir)
-  ptx = cuda_backend.make_ptx(
-      llir,
-      metadata,
-      cuda_options,
-      compute_capability,
-  )
-  if cuda_options.debug:
-    print(ptx)
-  name = metadata["name"]
-  ttgir = str(ttgir) if _JAX_TRITON_DUMP_DIR else None
-  llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
-  return CompilationResult(
-      binary=ptx,
-      name=name,
-      shared_mem_bytes=shared_mem_bytes,
-      ttgir=ttgir,
-      llir=llir,
-  )
+    # verify the pipeline ends on stages we expect to safeguard against unexpected
+    # upstream changes
+    stage_seq = tuple(stages.keys())
+    assert len(stage_seq) > 2
+    if is_cuda:
+      assert stage_seq[-1] == "cubin" and stage_seq[-2] == "ptx"
+      # we don't need the `cubin` stage
+      stages.pop("cubin", None)
+    elif is_rocm:
+      assert stage_seq[-1] == "hsaco"
+    else:
+      raise ValueError("Unsupported platform.")
 
+    shared_mem_bytes = None
+    # Unfortunately, we can't save individual stage results without making expensive
+    # copies of module object, so instead we save only the results we really need
+    ttgir = None
+    llir = None
+    try:
+      prev_stage = None
+      for stage, compile_ir in stages.items():
+        next_module = compile_ir(module, metadata)
+        if debug:
+          print(f"Compilation, after stage={stage}:", next_module)
 
-def compile_ttir_to_hsaco_inplace(
-    ttir,
-    hip_backend: hb.HIPBackend,
-    hip_options: hb.HIPOptions,
-    compute_capability,
-) -> CompilationResult:
-  if hip_options.debug:
-    print(ttir)
-  try:
-    metadata = {}
-    opt_ttir = hip_backend.make_ttir(ttir, metadata, hip_options)
-    ttgir = hip_backend.make_ttgir(opt_ttir, metadata, hip_options)
-  except RuntimeError as e:
-    ttir.dump()
-    raise ValueError("TTIR->TTGIR pass failed!") from e
-  if hip_options.debug:
-    print(ttgir)
-  try:
-    llir = hip_backend.make_llir(ttgir, metadata, hip_options)
-  except RuntimeError as e:
-    ttgir.dump()
-    raise ValueError("TTGIR->LLIR pass failed!") from e
-  shared_mem_bytes = metadata["shared"]
-  if hip_options.debug:
-    print(llir)
+        if stage == "llir":
+          if is_cuda and metadata["tmem_size"] > _TMEM_MAX_SIZE:
+            raise ValueError(
+              f"TMEM size {metadata['tmem_size']} exceeds limit {_TMEM_MAX_SIZE}."
+            )
+          shared_mem_bytes = metadata["shared"]
+          if _JAX_TRITON_DUMP_DIR:
+            llir = str(next_module)
+        elif bool(_JAX_TRITON_DUMP_DIR) and stage == "ttgir":
+          ttgir = str(next_module)
 
-  amdgcn = hip_backend.make_amdgcn(llir, metadata, hip_options)
-  hsaco = hip_backend.make_hsaco(amdgcn, metadata, hip_options)
+        module = next_module
+        prev_stage = stage
 
-  name = metadata["name"]
-  ttgir = str(ttgir) if _JAX_TRITON_DUMP_DIR else None
-  llir = str(llir) if _JAX_TRITON_DUMP_DIR else None
-  # Instead of passing hsaco which are "bytes", we first write
-  # to a file and then pass the "string" path. This is needed because
-  # nanobind doesn't automatically convert between bytes and string.
-  # https://github.com/wjakob/nanobind/discussions/137
-  fd, hsaco_path = tempfile.mkstemp()
-  with os.fdopen(fd, "wb") as f:
-    f.write(hsaco)
-  return CompilationResult(
-      binary=hsaco_path,
-      name=name,
-      shared_mem_bytes=shared_mem_bytes,
-      ttgir=ttgir,
-      llir=llir,
-  )
+    except RuntimeError as e:
+      module.dump()
+      raise ValueError(f"{prev_stage}->{stage} pass failed!") from e
+
+    assert shared_mem_bytes is not None
+
+    if is_rocm:
+      # Instead of passing hsaco which are "bytes", we first write
+      # to a file and then pass the "string" path. This is needed because
+      # nanobind doesn't automatically convert between bytes and string.
+      # https://github.com/wjakob/nanobind/discussions/137
+      fd, hsaco_path = tempfile.mkstemp()
+      with os.fdopen(fd, "wb") as f:
+        f.write(module)
+      module = hsaco_path
+
+    self.name = metadata["name"]
+    self.ttgir = ttgir
+    self.llir = llir
+    self.shared_mem_bytes = shared_mem_bytes
+    self.binary = module
 
 
 def make_backend(
@@ -630,6 +581,10 @@ class JTJITFunction:
     """
     return self.fn._jT_asm if hasattr(self.fn, "_jT_asm") else None
 
+  def clean_asm(self):
+    if hasattr(self.fn, "_jT_asm"):
+      self.fn._jT_asm = {}
+
   @property
   def compiled_kernels_cache_size(self) -> int:
     return len(self.fn._jT_kernel_cache) if hasattr(self.fn, "_jT_kernel_cache") else 0
@@ -798,9 +753,10 @@ class JTJITFunction:
       codegen_fns = backend.get_codegen_implementation(backend_options)
 
       real_ASTSource = gl_runtime.GluonASTSource if self.is_gluon else tc.ASTSource
-      module = real_ASTSource(
+      source = real_ASTSource(
         self.fn, constexprs=constexprs, signature=signature, attrs=attrs
-      ).make_ir(
+      )
+      module = source.make_ir(
         gpu_target, backend_options, codegen_fns, backend.get_module_map(), context
       )
 
@@ -810,8 +766,13 @@ class JTJITFunction:
       # unfortunately, it doesn't provide access to it, so we have to store it manually
       # elsewhere for proper testing.
 
-      compilation_result = compile_ttir_inplace(
-        module, backend, backend_options, compute_capability, platform
+      compilation_result = CompilationResult(
+        source,
+        module,
+        gpu_target,
+        backend,
+        backend_options,
+        platform,
       )
 
       kernel_name = compilation_result.name
@@ -1377,11 +1338,15 @@ class JTArray:
   _default_alignment = 16
 
   def __init__(self, avals: list, idx: int):
-    self.dtype = get_type_id(avals[idx])
+    aval = avals[idx]
+    self.dtype = get_type_id(aval)
     self.index = idx  # index into a corresponding avals arrays.
     # TODO(sharadmv,zhangqiaorjc): handle differently aligned pointers
     self.data_ptr = lambda: JTArray._default_alignment
-    # self.shape = aval.shape  # might be redundant
+    size = aval_size_bytes(aval)
+    # ptr_range() is mandatory on AMD to trigger correct return from
+    # HIPBackend.is_within_2gb() which is an important precondition for vectorized ops
+    self.ptr_range = lambda: size
 
 
 def deserialize_args_kwargs(

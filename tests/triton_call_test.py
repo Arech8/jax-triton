@@ -593,15 +593,14 @@ class TritonKernelCallTest(parameterized.TestCase):
     x1, y1 = create_random_inputs([42])
     x2, y2 = create_random_inputs([43])
 
-    compile_ttir_inplace = jttl.compile_ttir_inplace
-
     call_count = [0]
 
-    def my_compile(*args, **kwargs):
-      call_count[0] += 1
-      return compile_ttir_inplace(*args, **kwargs)
+    class MyCompilationResult(jttl.CompilationResult):
+      def __init__(self, *args, **kwargs):
+        call_count[0] += 1
+        super().__init__(*args, **kwargs)
 
-    with mock.patch.object(jttl, "compile_ttir_inplace", new=my_compile):
+    with mock.patch.object(jttl, "CompilationResult", new=MyCompilationResult):
       _ = fn1(x1, y1)
       self.assertEqual(call_count[0], 1)
       self.assertEqual(jt_cache_size(), 1)
