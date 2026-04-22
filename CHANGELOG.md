@@ -1,3 +1,8 @@
+# 0.5.1
+## Bugfixes
+- Gluon wasn't compiled using correct compilation pipeline, so the compilation pipelines
+for both dialects were reworked to delegate pipeline construction to the upstream Triton
+
 # 0.5.0
 ## Breaking changes
 - `float` now follows upstream convention and is represented as `fp32`, instead of old

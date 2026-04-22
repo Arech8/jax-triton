@@ -24,6 +24,7 @@ import jax.numpy as jnp
 from jax import config
 from jax import random
 import jax_triton as jt
+import jax_triton.triton_lib as jttl
 import numpy as np
 import triton
 
@@ -93,19 +94,40 @@ def memcpy_inplace_output_kernel(in_ptr, out_ptr, xnumel, XBLOCK: gl.constexpr):
 class GluonTest(parameterized.TestCase):
   @parameterized.product(dtype=_JAX_DTYPES)
   def test_copy_scalar_kernel(self, dtype):
+    # this also tests if HIPBackend.is_within_2gb() works correctly on AMD.
+    # Might be wrong, but looks like NVIDIA doesn't have anything similar to that and
+    # it's compiler don't even override `get_tensor_specialization()` which on AMD adds
+    # "S" attribute based on is_within_2gb() output.
+
+    # We need the platform ID, and I didn't find a better way than this ugliness
+    backends = jax.extend.backend.backends()
+    default = jax.extend.backend.get_backend()
+    name = next((n for n, c in backends.items() if c is default))
+    is_rocm = name == "rocm"
+
     def copy_scalar(input: jnp.ndarray) -> jnp.ndarray:
       assert input.size == 1 and input.ndim == 0
-      # note, this also checks behaviour in the absence of metaparams args.
       return jt.triton_call(
         input,
         kernel=copy_scalar_kernel,
-        out_shape=jax.ShapeDtypeStruct(shape=input.shape, dtype=input.dtype),
+        out_shape=input,
         grid=1,
+        _store_asm=is_rocm,
       )
 
     input = jnp.array(42.314, dtype=dtype)
     output = copy_scalar(input)
     np.testing.assert_equal(output, input)
+
+    if is_rocm:
+      jtkernel = jttl.JTJITFunction(copy_scalar_kernel)
+      asm = jtkernel.asm
+      assert len(asm) == 1
+      ttir = next(iter(asm.values())).get("ttir")
+      assert ttir.count("tt.pointer_range = 32 : i32") == 2, (
+        "Expected that each array argument has a pointer_range attribute"
+      )
+      jtkernel.clean_asm()
 
   @parameterized.product(XBLOCK=[64], xnumel=[40, 500, 16 * 1024 + 1])
   def test_memcpy(self, XBLOCK, xnumel):
