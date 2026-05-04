@@ -24,13 +24,15 @@ def generate_gemm_afp4wfp4_inputs(
   dtype,
   layout="TN",
   output=True,
-  key = random.key(5),
+  key=random.key(5),
 ):
   assert not isinstance(dtype, str)
 
   def randint(key, shape, min, max, dtype, transpose=False):
     key, k = random.split(key)
-    r = random.randint(k, shape if not transpose else shape[::-1], min, max, dtype=dtype)
+    r = random.randint(
+      k, shape if not transpose else shape[::-1], min, max, dtype=dtype
+    )
     return key, r
 
   if layout[0] == "T":
@@ -77,11 +79,12 @@ def generate_gemm_afp4wfp4_inputs(
   return (
     x,
     w,
-    w_shuffed,
-    x_scales[:M],
-    w_scales,
-    x_scales_shuffled[:M],
-    w_scales_shuffled,
+    w_shuffed,  # w_triton
+    # x_scales and w_scales, and their derivations, must always be transposed.
+    x_scales[:M],  # x_scales
+    w_scales,  # w_scales
+    x_scales_shuffled[:M],  # x_scales_triton
+    w_scales_shuffled,  # w_scales_triton
     out_dtype,
     y,
   )
@@ -202,7 +205,7 @@ def run_triton(
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
 @pytest.mark.parametrize("layout", ["TN", "TT", "NN", "NT"])
 @pytest.mark.parametrize("output", [True, False])
-@pytest.mark.parametrize("shuffle_weight_scales", [False]) #  [True, False], )
+@pytest.mark.parametrize("shuffle_weight_scales", [False])  #  [True, False], )
 @pytest.mark.parametrize("skip_reduce", [True, False])
 @pytest.mark.parametrize("impl", ["triton", "gluon"])
 def test_gemm_afp4_wfp4(
