@@ -3,7 +3,9 @@
 # match jax-triton calling conventions
 
 import functools
-from typing import Optional
+from typing import Optional, Tuple
+
+from strided_array import StridedArray
 
 import triton
 import triton.language as tl
@@ -127,15 +129,28 @@ def _gemm_afp4wfp4_kernel(
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
     for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-      a_scales = tl.load(a_scale_ptrs)
-      b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
-
-      # Load the next block of A and B, generate a mask by checking the K dimension.
-      # If it is out of bounds, set it to 0.
+      # When EVEN_K is true, K / SG is an exact multiple of (BLOCK_SIZE_K / SG),
+      # so the scale-pointer arithmetic stays in-bounds and the unconditional
+      # tl.load matches the register layout tl.dot_scaled expects.
+      # When EVEN_K is false, the tail K-iteration overshoots the scale buffer
+      # in the K-scale axis. We mask out those lanes to avoid reading 0xFF bytes
+      # (which decode as e8m0 NaN) from past-the-end memory.
       if EVEN_K:
+        a_scales = tl.load(a_scale_ptrs)
+        b_scales = tl.load(b_scale_ptrs, cache_modifier=cache_modifier)
         a = tl.load(a_ptrs)
         b = tl.load(b_ptrs, cache_modifier=cache_modifier)
       else:
+        k_scale_mask = offs_ks < (2 * K // SCALE_GROUP_SIZE) - k * (
+          BLOCK_SIZE_K // SCALE_GROUP_SIZE
+        )
+        a_scales = tl.load(a_scale_ptrs, mask=k_scale_mask[None, :], other=0)
+        b_scales = tl.load(
+          b_scale_ptrs,
+          mask=k_scale_mask[None, :],
+          other=0,
+          cache_modifier=cache_modifier,
+        )
         a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * (BLOCK_SIZE_K // 2), other=0)
         b = tl.load(
           b_ptrs,
@@ -266,46 +281,139 @@ global _USE_GEMM_SPLITK_BF16
 _USE_GEMM_SPLITK_BF16 = False
 
 
-@functools.partial(
-  jax.jit, static_argnames=("dtype", "skip_reduce", "config"), donate_argnames="y"
-)
 def gemm_afp4wfp4(
-  x: jnp.ndarray,
-  w: jnp.ndarray,
-  x_scales: jnp.ndarray,
-  w_scales: jnp.ndarray,
+  x: StridedArray,
+  w: StridedArray,
+  x_scales: StridedArray,
+  w_scales: StridedArray,
   dtype: Optional[jnp.dtype] = jnp.bfloat16,
   y: Optional[jnp.ndarray] = None,
   config: Optional[dict] = None,
   skip_reduce: Optional[bool] = False,
 ) -> jnp.ndarray:
-  """
-  Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
+  """Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
+
+  This launcher trusts its inputs: it neither inspects the underlying buffer
+  orientation nor copies any tensor for layout reasons. The caller is responsible
+  for delivering each operand with the strides expected by the kernel below;
+  precondition assertions in the launcher will fail loud if that contract is broken.
+
+  The only stride-affecting operation the launcher performs is the ``w = w.T``
+  that has always been part of its API contract; this is implemented as a
+  zero-copy Python tuple swap on the wrapper's strides before they are passed
+  into the private jitted inner.
+
+  Per-operand layout precondition (on the wrapper's logical view, with strides in
+  element units):
+
+      x.shape          == (M, K // 2)             ; x.strides        == (K // 2, 1)
+      w.shape          == (N, K // 2)             ; w.strides        == (K // 2, 1)   (pre-T)
+      x_scales.shape   == (M, K // SCALE_GROUP_SIZE)
+                                                  ; x_scales.strides[0] == 1
+      w_scales.shape   == (N, K // SCALE_GROUP_SIZE)
+                                                  ; w_scales.strides[0] == 1
+      y (if provided)  : jnp.ndarray of shape (M, N), C-contiguous
+
+  After the internal w = w.T the kernel sees w with shape (K // 2, N) and strides
+  (1, K // 2), i.e. K unit-stride. The kernel-tile register layouts (blocked_mk,
+  blocked_kn, blocked_scales) are tuned for exactly these orientations.
 
   Args:
-      x (jnp.ndarray): FP4 E2M1 input matrix with shape (M, K//2).
-      w (jnp.ndarray): FP4 E2M1 weight matrix with shape (N, K//2), internally transposed.
-      x_scales (jnp.ndarray): E8M0 per-group scale for x with shape (M, K//32).
-          One scale per 32 elements in K dimension.
-      w_scales (jnp.ndarray): E8M0 per-group scale for w with shape (N, K//32).
-          One scale per 32 elements in K dimension.
-      dtype (Optional[jnp.dtype]): Output datatype (BF16 or FP16).
-      y (Optional[jnp.ndarray]): Pre-allocated output tensor with shape (M, N).
-      config (Optional[dict]): Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
+      x: FP4 E2M1 activation matrix wrapper, logical shape (M, K // 2),
+          K unit-stride.
+      w: FP4 E2M1 weight matrix wrapper, logical shape (N, K // 2), K unit-stride.
+          Internally flipped to (K // 2, N) before the kernel call via a stride
+          tuple swap.
+      x_scales: E8M0 per-group scales for x, logical shape (M, K // 32),
+          M unit-stride. One scale per 32 elements in the K dimension.
+      w_scales: E8M0 per-group scales for w, logical shape (N, K // 32),
+          N unit-stride.
+      dtype: Output dtype (jnp.bfloat16 or jnp.float16).
+      y: Optional pre-allocated output of shape (M, N).
+      config: Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
           BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
-      skip_reduce (Optional[bool]): skip reduction, y becomes (SPK, M, N) where SPK is determined by config
+      skip_reduce: If True and NUM_KSPLIT > 1, returns the partial-reduction
+          tensor of shape (NUM_KSPLIT, M, N).
 
   Returns:
-      y (jnp.ndarray): Output with shape (M, N) or (SPK, M, N).
-  """
+      The output tensor with shape (M, N), or (NUM_KSPLIT, M, N) when
+      ``skip_reduce`` is True with NUM_KSPLIT > 1.
 
+  Raises:
+      AssertionError: If any input violates the layout precondition.
+  """
   assert arch_info.is_fp4_avail(), "MXFP4 is not available on your device"
 
-  M, K = x.shape
-  N, K = w.shape
+  M, K2 = x.shape
+  N, K2_w = w.shape
+  assert K2 == K2_w, f"K mismatch: x.shape[1]={K2}, w.shape[1]={K2_w}"
+  K = K2 * 2
 
-  # Transpose w
-  w = w.T
+  assert x.strides == (K2, 1), (
+    f"x.strides={x.strides}; expected ({K2}, 1)"
+  )
+  assert w.strides == (K2, 1), (
+    f"w.strides={w.strides}; expected ({K2}, 1) (pre-T)"
+  )
+  assert x_scales.shape == (M, K // 32)
+  assert w_scales.shape == (N, K // 32)
+  assert x_scales.strides[0] == 1, (
+    f"x_scales.strides={x_scales.strides}; expected strides[0]==1"
+  )
+  assert w_scales.strides[0] == 1, (
+    f"w_scales.strides={w_scales.strides}; expected strides[0]==1"
+  )
+
+  w_strides_post_T = (w.strides[1], w.strides[0])
+
+  return _gemm_afp4wfp4_jit(
+    x.data,
+    w.data,
+    x_scales.data,
+    w_scales.data,
+    y,
+    x_strides=x.strides,
+    w_strides=w_strides_post_T,
+    x_scales_strides=x_scales.strides,
+    w_scales_strides=w_scales.strides,
+    dtype=dtype,
+    config=config,
+    skip_reduce=skip_reduce,
+  )
+
+
+@functools.partial(
+  jax.jit,
+  static_argnames=(
+    "x_strides",
+    "w_strides",
+    "x_scales_strides",
+    "w_scales_strides",
+    "dtype",
+    "config",
+    "skip_reduce",
+  ),
+  donate_argnames="y",
+)
+def _gemm_afp4wfp4_jit(
+  x_data: jnp.ndarray,
+  w_data: jnp.ndarray,
+  x_scales_data: jnp.ndarray,
+  w_scales_data: jnp.ndarray,
+  y: Optional[jnp.ndarray],
+  *,
+  x_strides: Tuple[int, int],
+  w_strides: Tuple[int, int],
+  x_scales_strides: Tuple[int, int],
+  w_scales_strides: Tuple[int, int],
+  dtype: jnp.dtype,
+  config: Optional[dict],
+  skip_reduce: bool,
+) -> jnp.ndarray:
+  """Private jitted launcher; layout contract validated by gemm_afp4wfp4."""
+
+  M, K = x_data.shape
+  N = w_data.shape[0]
 
   if config is None:
     config, _ = _get_config(M, N, K)
@@ -358,27 +466,25 @@ def gemm_afp4wfp4(
   out_tensor_y = y if unit_NUM_KSPLIT else y_pp
 
   result = jt.triton_call(
-    x,
-    w,
+    x_data,
+    w_data,
     out_tensor_y,
-    x_scales,
-    w_scales,
+    x_scales_data,
+    w_scales_data,
     M,
     N,
     K,
-    x.shape[1],  # x.stride(0),
-    1,  # x.stride(1),
-    w.shape[1],  # w.stride(0),
-    1,  # w.stride(1),
+    x_strides[0],
+    x_strides[1],
+    w_strides[0],
+    w_strides[1],
     0 if unit_NUM_KSPLIT else y_pp_stride[0],
-    # y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp_stride[1],
     y.shape[1] if unit_NUM_KSPLIT else y_pp_stride[1],
-    # y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp_stride[2],
     1 if unit_NUM_KSPLIT else y_pp_stride[2],
-    x_scales.shape[1],  # x_scales.stride(0),
-    1,  # x_scales.stride(1),
-    w_scales.shape[1],  # w_scales.stride(0),
-    1,  # w_scales.stride(1),
+    x_scales_strides[0],
+    x_scales_strides[1],
+    w_scales_strides[0],
+    w_scales_strides[1],
     kernel=_gemm_afp4wfp4_kernel,
     input_output_aliases={2: 0},
     out_shape=jax.ShapeDtypeStruct(shape=out_tensor_y.shape, dtype=out_tensor_y.dtype),
@@ -426,3 +532,21 @@ def gemm_afp4wfp4(
     y = result
 
   return y
+
+
+def gemm_afp4wfp4_from_arrays(x, w, x_scales, w_scales, *args, **kwargs):
+  """Convenience adapter for callers that have raw jnp.ndarray.
+
+  The same layout contract documented on gemm_afp4wfp4 still applies; this helper
+  only saves the caller from writing StridedArray.from_array four times. No data
+  is copied. If the raw arrays are not in the kernel-optimal orientation, the
+  launcher's contract assertions will fail.
+  """
+  return gemm_afp4wfp4(
+    StridedArray.from_array(x),
+    StridedArray.from_array(w),
+    StridedArray.from_array(x_scales),
+    StridedArray.from_array(w_scales),
+    *args,
+    **kwargs,
+  )

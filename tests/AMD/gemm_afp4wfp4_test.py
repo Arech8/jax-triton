@@ -9,6 +9,7 @@ import numpy as np
 import arch_info
 from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
 from gemm_afp4wfp4_triton import gemm_afp4wfp4 as triton_gemm_afp4wfp4
+from strided_array import StridedArray
 
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/op_tests/triton_tests/gemm/basic/test_gemm_afp4wfp4.py
 
@@ -28,41 +29,42 @@ def generate_gemm_afp4wfp4_inputs(
 ):
   assert not isinstance(dtype, str)
 
-  def randint(key, shape, min, max, dtype, transpose=False):
-    key, k = random.split(key)
-    r = random.randint(
-      k, shape if not transpose else shape[::-1], min, max, dtype=dtype
-    )
-    return key, r
+  def _randint(key, shape, lo, hi, dtype):
+    key, sub = random.split(key)
+    return key, random.randint(sub, shape, lo, hi, dtype=dtype)
 
   if layout[0] == "T":
-    # 34 is two packed e2m1 values 0010 which is 1.0.
-    key, x_low = randint(key, (M, K // 2), 0, 16, dtype=jnp.uint8)
-    key, x_high = randint(key, (M, K // 2), 0, 16, dtype=jnp.uint8)
+    key, x_low = _randint(key, (M, K // 2), 0, 16, jnp.uint8)
+    key, x_high = _randint(key, (M, K // 2), 0, 16, jnp.uint8)
+    x_data = x_high << 4 | x_low
+    x = StridedArray.from_array(x_data)
   else:
-    key, x_low = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8, transpose=True)
-    key, x_high = randint(key, (K // 2, M), 0, 16, dtype=jnp.uint8, transpose=True)
+    key, x_low = _randint(key, (K // 2, M), 0, 16, jnp.uint8)
+    key, x_high = _randint(key, (K // 2, M), 0, 16, jnp.uint8)
+    x_swapped = x_high << 4 | x_low
+    x_data = StridedArray.from_array(x_swapped).T.to_jax()
+    x = StridedArray.from_array(x_data)
 
   if layout[1] == "N":
-    key, w_low = randint(key, (N, K // 2), 0, 16, dtype=jnp.uint8)
-    key, w_high = randint(key, (N, K // 2), 0, 16, dtype=jnp.uint8)
+    key, w_low = _randint(key, (N, K // 2), 0, 16, jnp.uint8)
+    key, w_high = _randint(key, (N, K // 2), 0, 16, jnp.uint8)
+    w_data = w_low | w_high << 4
+    w = StridedArray.from_array(w_data)
   else:
-    key, w_low = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8, transpose=True)
-    key, w_high = randint(key, (K // 2, N), 0, 16, dtype=jnp.uint8, transpose=True)
+    key, w_low = _randint(key, (K // 2, N), 0, 16, jnp.uint8)
+    key, w_high = _randint(key, (K // 2, N), 0, 16, jnp.uint8)
+    w_swapped = w_low | w_high << 4
+    w_data = StridedArray.from_array(w_swapped).T.to_jax()
+    w = StridedArray.from_array(w_data)
 
-  # Doing this computation on GPU tensors results in NaNs, so move it to GPU afterwards
-  x = x_high << 4 | x_low
-  # x = x.to(device="cuda")
-
-  w = w_low | w_high << 4
-  # Scale of 1.0 in e8m0, bias 127.
   M_pad = (M + 255) // 256 * 256
-  key, x_scales = randint(
-    key, (K // SCALE_GROUP_SIZE, M_pad), 124, 128, dtype=jnp.uint8
+  key, xs_data = _randint(
+    key, (K // SCALE_GROUP_SIZE, M_pad), 124, 128, jnp.uint8
   )
-  key, w_scales = randint(key, (K // SCALE_GROUP_SIZE, N), 124, 128, dtype=jnp.uint8)
-  x_scales = x_scales.T
-  w_scales = w_scales.T
+  key, ws_data = _randint(key, (K // SCALE_GROUP_SIZE, N), 124, 128, jnp.uint8)
+
+  x_scales = StridedArray.from_array(xs_data).T[:M]
+  w_scales = StridedArray.from_array(ws_data).T
 
   x_scales_shuffled = x_scales
   w_scales_shuffled = w_scales
@@ -80,10 +82,9 @@ def generate_gemm_afp4wfp4_inputs(
     x,
     w,
     w_shuffed,  # w_triton
-    # x_scales and w_scales, and their derivations, must always be transposed.
-    x_scales[:M],  # x_scales
+    x_scales,  # x_scales
     w_scales,  # w_scales
-    x_scales_shuffled[:M],  # x_scales_triton
+    x_scales_shuffled,  # x_scales_triton
     w_scales_shuffled,  # w_scales_triton
     out_dtype,
     y,
@@ -235,7 +236,13 @@ def test_gemm_afp4_wfp4(
     y,
   ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output)
 
-  expected = jax_afp4wfp4(x, w, x_scales, w_scales, dtype)
+  expected = jax_afp4wfp4(
+    x.to_jax(),
+    w.to_jax(),
+    x_scales.to_jax(),
+    w_scales.to_jax(),
+    dtype,
+  )
 
   if impl == "triton":
     impl = triton_gemm_afp4wfp4
