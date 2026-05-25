@@ -203,3 +203,20 @@ class StridedArray:
     perm, post_slice = self._view_as_permutation_and_slice()
     arr = jnp.transpose(self.data, perm)
     return arr[post_slice]
+
+
+# Register StridedArray as a JAX pytree below isn't mandatory, but simplifies, for
+# example benchmarking, that doesn't have to handle special case before calling
+# `jax.block_until_ready()` on data elements returned by an input generating function
+# in form of StridedArray objects.
+def _strided_flatten(sa):
+    children = (sa.data,)
+    aux = (sa.shape, sa.strides, sa.offset)
+    return children, aux
+
+def _strided_unflatten(aux, children):
+    shape, strides, offset = aux
+    (data,) = children
+    return StridedArray(data, shape=shape, strides=strides, offset=offset)
+
+jax.tree_util.register_pytree_node(StridedArray, _strided_flatten, _strided_unflatten)
