@@ -20,6 +20,95 @@ from triton.experimental.gluon import language as gl
 import arch_info
 
 
+########################################################  gemm_afp4wfp4 gluon props
+
+
+@qb.registerBenchmark
+def make_gemm_afp4wfp4_gluon_tpw_benchmark() -> dict[str, tuple[Callable, Callable]]:
+  if not arch_info.is_fp4_avail():
+    print(
+      "MXFP4 not supported on this architecture (requires CDNA4). Skipping gemm_afp4wfp4 benchmarks."
+    )
+    return {}
+
+  from gemm_afp4wfp4_test import generate_gemm_afp4wfp4_inputs
+  from gemm_afp4wfp4_gluon import gemm_afp4wfp4 as gluon_gemm_afp4wfp4
+
+  k = jax.random.key(42)
+
+  def init(M, N, K, dtype, layout="TN", output=True, skip_reduce=False) -> list:
+    nonlocal k
+    if _random_inputs:
+      k, s = jax.random.split(k)
+    else:
+      s = k
+    (x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, y) = (
+      generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output, key=s)
+    )
+    return [x, w_triton, x_scales_triton, w_scales_triton, dtype, y, None, skip_reduce]
+
+  def instantiate_config(m_n_k, dtype, layout, output, skip_reduce):
+    return lambda: init(
+      *m_n_k, dtype, layout=layout, output=output, skip_reduce=skip_reduce
+    )
+
+  def make_benchmarks(cfg):
+    return {
+      f"gemm_afp4wfp4({m_n_k[0]},{m_n_k[1]},{m_n_k[2]},{dtype.__name__},{layout},"
+      f"{'output' if output else 'no_output'},{'skip' if skip_reduce else 'no_skip'})|tpw{BLOCKED_SCALES_MAIN_TPW}": (
+        partial(gluon_gemm_afp4wfp4, BLOCKED_SCALES_MAIN_TPW=BLOCKED_SCALES_MAIN_TPW),
+        instantiate_config(m_n_k, dtype, layout, output, skip_reduce),
+      )
+      for m_n_k, dtype, layout, output, skip_reduce, BLOCKED_SCALES_MAIN_TPW in cfg
+    }
+
+  # gluon kernel config is optimized for M=N=K=8192, so to compare apples to apples,
+  # trying values around that
+  drop_similar = True  # don't benchmark configs yielding not much different results
+
+  ret = make_benchmarks(
+    itertools.product(
+      [
+        (8192, 8192, 8192),
+      ],
+      [jnp.bfloat16] if drop_similar else [jnp.bfloat16, jnp.float16],
+      ["TN"] if drop_similar else ["TN", "TT", "NN", "NT"],
+      [False] if drop_similar else [True, False],
+      [False] if drop_similar else [True, False],
+      [64, 32, 16],  # BLOCKED_SCALES_MAIN_TPW
+    )
+  )
+  if not _single_gemm:
+    ret.update(
+      make_benchmarks(
+        itertools.product(
+          [
+            (4 * 8192, 4 * 8192, 4 * 8192),
+            (8192 // 2, 8192 // 2, 8192 // 2),
+            (8192 // 4, 8192 // 4, 8192 // 4),
+            (4 * 8192, 8192, 4 * 8192),
+            (8192, 4 * 8192, 8192),
+            (8192 // 2, 8192 * 2, 8192 // 2),
+            (8192 // 4, 8192 * 4, 8192 // 4),
+            (8192 * 4, 8192 // 4, 8192 * 4),
+            (4864, 8192, 4160),
+            (16, 16384, 3328 * 2),
+            # (128, 16384, 3328 * 2),
+            (256, 256, 256),
+            (256, 8192, 256),
+            (1, 1, 32),
+          ],
+          [jnp.bfloat16],  # [jnp.bfloat16, jnp.float16],
+          ["TN"],  # ["TN", "TT", "NN", "NT"],
+          [False],  # [True, False],
+          [False],  # [True, False],
+          [64, 32, 16],  # BLOCKED_SCALES_MAIN_TPW
+        )
+      )
+    )
+  return ret
+
+
 ######################################################################  gemm_afp4wfp4
 
 

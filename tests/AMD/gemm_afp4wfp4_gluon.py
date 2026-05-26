@@ -63,6 +63,7 @@ def _gemm_afp4wfp4_kernel(
   waves_per_eu: gl.constexpr,
   matrix_instr_nonkdim: gl.constexpr,
   cache_modifier: gl.constexpr,
+  BLOCKED_SCALES_MAIN_TPW: gl.constexpr,
 ):
   """
   Kernel for computing the matmul C = A x B.
@@ -109,7 +110,8 @@ def _gemm_afp4wfp4_kernel(
 
   blocked_scales: gl.constexpr = gl.BlockedLayout(
     size_per_thread=[4, 1],
-    threads_per_warp=[64, 1],
+    # threads_per_warp=[64, 1],
+    threads_per_warp=[BLOCKED_SCALES_MAIN_TPW, 64 // BLOCKED_SCALES_MAIN_TPW],
     warps_per_cta=[1, num_warps],
     order=[0, 1],
   )
@@ -494,6 +496,7 @@ def gemm_afp4wfp4(
   y: Optional[jnp.ndarray] = None,
   config: Optional[dict] = None,
   skip_reduce: Optional[bool] = False,
+  BLOCKED_SCALES_MAIN_TPW : int = 64,
 ) -> jnp.ndarray:
   """Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
 
@@ -583,6 +586,7 @@ def gemm_afp4wfp4(
     dtype=dtype,
     config=config,
     skip_reduce=skip_reduce,
+    BLOCKED_SCALES_MAIN_TPW=BLOCKED_SCALES_MAIN_TPW,
   )
 
 
@@ -596,6 +600,7 @@ def gemm_afp4wfp4(
     "dtype",
     "config",
     "skip_reduce",
+    "BLOCKED_SCALES_MAIN_TPW",
   ),
   donate_argnames="y",
 )
@@ -613,8 +618,11 @@ def _gemm_afp4wfp4_jit(
   dtype: jnp.dtype,
   config: Optional[dict],
   skip_reduce: bool,
+  BLOCKED_SCALES_MAIN_TPW: int,
 ) -> jnp.ndarray:
   """Private jitted launcher; layout contract validated by gemm_afp4wfp4."""
+
+  assert 64 % BLOCKED_SCALES_MAIN_TPW == 0
 
   M, K = x_data.shape
   N = w_data.shape[0]
@@ -686,6 +694,7 @@ def _gemm_afp4wfp4_jit(
     input_output_aliases={2: 0},
     out_shape=jax.ShapeDtypeStruct(shape=out_tensor_y.shape, dtype=out_tensor_y.dtype),
     grid=grid,
+    BLOCKED_SCALES_MAIN_TPW=BLOCKED_SCALES_MAIN_TPW,
     **config,
   )
 
