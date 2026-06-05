@@ -171,9 +171,13 @@ def mxfp4_to_f32(x):
 
 
 def e8m0_to_f32(x):
-  x_f32 = 2 ** ((x - 127).astype(jnp.float32))
+  x_f32 = 2 ** (x.astype(jnp.float32) - 127)
+  # WARNING! The original implementation:
   # x_f32[x_f32 == 128] = float("nan")
-  x_f32 = x_f32.at[x_f32 == 128].set(jnp.nan)
+  # has a bug: it must map the original x==255 to a NaN, instead it left x_f32 poisoned
+  # with inf <= 2**(255-127) == 2**128, but remaps legitimate x==134 or
+  # x_f32==2**(134-127)==2**7==128 to NaN
+  x_f32 = x_f32.at[x == 255].set(jnp.nan)
   return x_f32
 
 
