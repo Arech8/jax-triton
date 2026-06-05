@@ -58,9 +58,7 @@ def generate_gemm_afp4wfp4_inputs(
     w = StridedArray.from_array(w_data)
 
   M_pad = (M + 255) // 256 * 256
-  key, xs_data = _randint(
-    key, (K // SCALE_GROUP_SIZE, M_pad), 124, 128, jnp.uint8
-  )
+  key, xs_data = _randint(key, (K // SCALE_GROUP_SIZE, M_pad), 124, 128, jnp.uint8)
   key, ws_data = _randint(key, (K // SCALE_GROUP_SIZE, N), 124, 128, jnp.uint8)
 
   x_scales = StridedArray.from_array(xs_data).T[:M]
@@ -69,25 +67,16 @@ def generate_gemm_afp4wfp4_inputs(
   x_scales_shuffled = x_scales
   w_scales_shuffled = w_scales
 
-  w_shuffed = w
-
-  y = None
-  if output:
-    y = jnp.empty((M, N), dtype=dtype)
-    out_dtype = (None,)
-  else:
-    out_dtype = dtype
+  w_shuffled = w
 
   return (
     x,
     w,
-    w_shuffed,  # w_triton
+    w_shuffled,  # w_triton
     x_scales,  # x_scales
     w_scales,  # w_scales
     x_scales_shuffled,  # x_scales_triton
     w_scales_shuffled,  # w_scales_triton
-    out_dtype,
-    y,
   )
 
 
@@ -142,11 +131,8 @@ def get_x_vals():
 
 def mxfp4_to_f32(x):
   # 2 because we pack fp4 in uint8.
-  # x = x.repeat_interleave(2, dim=1)
   x = jnp.repeat(x, 2, axis=1)
-  # x[:, ::2] = x[:, ::2] & 0xF
   x = x.at[:, ::2].set(x[:, ::2] & 0xF)
-  # x[:, 1::2] = x[:, 1::2] >> 4
   x = x.at[:, 1::2].set(x[:, 1::2] >> 4)
   mxfp4_list = [
     0.0,
@@ -187,23 +173,20 @@ def jax_afp4wfp4(x, w, x_scales, w_scales, dtype):
   w_f32 = mxfp4_to_f32(w)
   # Next convert the e8m0 scales to f32.
 
-  # x_scales = x_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
   x_scales = jnp.repeat(x_scales, SCALE_GROUP_SIZE, axis=1).astype(jnp.float32)
 
   x_scales_f32 = e8m0_to_f32(x_scales)
   x_f32 = x_f32 * x_scales_f32
-  # w_scales = w_scales.repeat_interleave(SCALE_GROUP_SIZE, dim=1).to(torch.float32)
   w_scales = jnp.repeat(w_scales, SCALE_GROUP_SIZE, axis=1).astype(jnp.float32)
   w_scales_f32 = e8m0_to_f32(w_scales)
   w_f32 = w_f32 * w_scales_f32
-  # return torch.mm(x_f32, w_f32.T).to(dtype)
   return jnp.matmul(x_f32, w_f32.T).astype(dtype)
 
 
 def run_triton(
-  x, w, x_scales, w_scales, dtype=jnp.bfloat16, y=None, skip_reduce=False, impl=None
+  x, w, x_scales, w_scales, dtype=jnp.bfloat16, skip_reduce=False, impl=None
 ):
-  return impl(x, w, x_scales, w_scales, dtype, y, skip_reduce=skip_reduce)
+  return impl(x, w, x_scales, w_scales, dtype, skip_reduce=skip_reduce)
 
 
 @pytest.mark.parametrize("M, N, K", get_x_vals())
@@ -236,8 +219,6 @@ def test_gemm_afp4_wfp4(
     w_scales,
     x_scales_triton,
     w_scales_triton,
-    out_dtype,
-    y,
   ) = generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output)
 
   expected = jax_afp4wfp4(
@@ -261,7 +242,6 @@ def test_gemm_afp4_wfp4(
     x_scales_triton,
     w_scales_triton,
     dtype,
-    y,
     skip_reduce=skip_reduce,
     impl=impl,
   )

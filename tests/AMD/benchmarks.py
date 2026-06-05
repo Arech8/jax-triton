@@ -43,10 +43,10 @@ def make_gemm_afp4wfp4_benchmark() -> dict[str, tuple[Callable, Callable]]:
       k, s = jax.random.split(k)
     else:
       s = k
-    (x, _, w_triton, _, _, x_scales_triton, w_scales_triton, _, y) = (
+    (x, _, w_triton, _, _, x_scales_triton, w_scales_triton) = (
       generate_gemm_afp4wfp4_inputs(M, N, K, dtype, layout=layout, output=output, key=s)
     )
-    return [x, w_triton, x_scales_triton, w_scales_triton, dtype, y, None, skip_reduce]
+    return [x, w_triton, x_scales_triton, w_scales_triton, dtype, None, skip_reduce]
 
   def instantiate_config(m_n_k, dtype, layout, output, skip_reduce, is_gluon):
     return lambda: init(

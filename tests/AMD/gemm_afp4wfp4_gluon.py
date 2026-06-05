@@ -1,6 +1,7 @@
 # based on https://github.com/ROCm/aiter/blob/7411c99753f0661a3eecdbdb1b36feb58539f62b/aiter/ops/triton/gluon/gemm_afp4wfp4.py
-# Kernels are copypasted, the launch function was rewritten to use JAX primitives and
-# match jax-triton calling conventions
+# Kernels were copypasted and output pointer was moved to the last position.
+# The launch function was rewritten to use JAX primitives and match jax-triton calling
+# conventions
 
 import functools
 import json
@@ -33,7 +34,7 @@ _USE_GEMM_SPLITK_BF16 = False
 def _gemm_afp4wfp4_kernel(
   a_ptr,
   b_ptr,
-  c_ptr,
+  # c_ptr,
   a_scales_ptr,
   b_scales_ptr,
   M,
@@ -50,6 +51,7 @@ def _gemm_afp4wfp4_kernel(
   stride_ask,
   stride_bsn,
   stride_bsk,
+  c_ptr,  # output goes last
   # Meta-parameters
   BLOCK_SIZE_M: gl.constexpr,
   BLOCK_SIZE_N: gl.constexpr,
@@ -390,7 +392,7 @@ def _gemm_afp4wfp4_kernel(
 @gluon.jit
 def _gemm_afp4wfp4_reduce_kernel(
   c_in_ptr,
-  c_out_ptr,
+  # c_out_ptr,
   M,
   N,
   stride_c_in_k,
@@ -398,6 +400,7 @@ def _gemm_afp4wfp4_reduce_kernel(
   stride_c_in_n,
   stride_c_out_m,
   stride_c_out_n,
+  c_out_ptr,  # output goes last
   BLOCK_SIZE_M: gl.constexpr,
   BLOCK_SIZE_N: gl.constexpr,
   ACTUAL_KSPLIT: gl.constexpr,
@@ -491,7 +494,6 @@ def gemm_afp4wfp4(
   x_scales: StridedArray,
   w_scales: StridedArray,
   dtype: Optional[jnp.dtype] = jnp.bfloat16,
-  y: Optional[jnp.ndarray] = None,
   config: Optional[dict] = None,
   skip_reduce: Optional[bool] = False,
 ) -> jnp.ndarray:
@@ -516,7 +518,6 @@ def gemm_afp4wfp4(
                                                   ; x_scales.strides[0] == 1
       w_scales.shape   == (N, K // SCALE_GROUP_SIZE)
                                                   ; w_scales.strides[0] == 1
-      y (if provided)  : jnp.ndarray of shape (M, N), C-contiguous
 
   After the internal w = w.T the kernel sees w with shape (K // 2, N) and strides
   (1, K // 2), i.e. K unit-stride. The kernel-tile register layouts (blocked_mk,
@@ -533,7 +534,6 @@ def gemm_afp4wfp4(
       w_scales: E8M0 per-group scales for w, logical shape (N, K // 32),
           N unit-stride.
       dtype: Output dtype (jnp.bfloat16 or jnp.float16).
-      y: Optional pre-allocated output of shape (M, N).
       config: Kernel tuning parameters (BLOCK_SIZE_M, BLOCK_SIZE_N,
           BLOCK_SIZE_K, GROUP_SIZE_M, NUM_KSPLIT, SPLITK_BLOCK_SIZE).
       skip_reduce: If True and NUM_KSPLIT > 1, returns the partial-reduction
@@ -553,12 +553,8 @@ def gemm_afp4wfp4(
   assert K2 == K2_w, f"K mismatch: x.shape[1]={K2}, w.shape[1]={K2_w}"
   K = K2 * 2
 
-  assert x.strides == (K2, 1), (
-    f"x.strides={x.strides}; expected ({K2}, 1)"
-  )
-  assert w.strides == (K2, 1), (
-    f"w.strides={w.strides}; expected ({K2}, 1) (pre-T)"
-  )
+  assert x.strides == (K2, 1), f"x.strides={x.strides}; expected ({K2}, 1)"
+  assert w.strides == (K2, 1), f"w.strides={w.strides}; expected ({K2}, 1) (pre-T)"
   assert x_scales.shape == (M, K // 32)
   assert w_scales.shape == (N, K // 32)
   assert x_scales.strides[0] == 1, (
@@ -575,7 +571,6 @@ def gemm_afp4wfp4(
     w.data,
     x_scales.data,
     w_scales.data,
-    y,
     x_strides=x.strides,
     w_strides=w_strides_post_T,
     x_scales_strides=x_scales.strides,
@@ -597,14 +592,12 @@ def gemm_afp4wfp4(
     "config",
     "skip_reduce",
   ),
-  donate_argnames="y",
 )
 def _gemm_afp4wfp4_jit(
   x_data: jnp.ndarray,
   w_data: jnp.ndarray,
   x_scales_data: jnp.ndarray,
   w_scales_data: jnp.ndarray,
-  y: Optional[jnp.ndarray],
   *,
   x_strides: Tuple[int, int],
   w_strides: Tuple[int, int],
@@ -639,18 +632,13 @@ def _gemm_afp4wfp4_jit(
   config["SPLITK_BLOCK_SIZE"] = SPLITK_BLOCK_SIZE
 
   if not unit_NUM_KSPLIT:
-    if _USE_GEMM_SPLITK_BF16:
-      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=dtype)
-    else:
-      y_pp = jnp.empty((config["NUM_KSPLIT"], M, N), dtype=jnp.float32)
-
-    y_pp_stride = (y_pp.shape[1] * y_pp.shape[2], y_pp.shape[2], 1)
+    y_pp_shape = (config["NUM_KSPLIT"], M, N)
+    y_pp_dtype = dtype if _USE_GEMM_SPLITK_BF16 else jnp.float32
+    y_pp_stride = (y_pp_shape[1] * y_pp_shape[2], y_pp_shape[2], 1)
   else:
-    y_pp = None
-    y_pp_stride = None
+    y_pp, y_pp_stride, y_pp_shape, y_pp_dtype = None, None, None, None
 
-  if y is None and (unit_NUM_KSPLIT or not skip_reduce):
-    y = jnp.empty((M, N), dtype=dtype)
+  y_shape = (M, N)
 
   grid = lambda META: (  # noqa: E731
     (
@@ -660,12 +648,16 @@ def _gemm_afp4wfp4_jit(
     ),
   )
 
-  out_tensor_y = y if unit_NUM_KSPLIT else y_pp
+  if unit_NUM_KSPLIT:
+    out_tensor_y_shape = y_shape
+    out_tensor_y_dtype = dtype
+  else:
+    out_tensor_y_shape = y_pp_shape
+    out_tensor_y_dtype = y_pp_dtype
 
   result = jt.triton_call(
     x_data,
     w_data,
-    out_tensor_y,
     x_scales_data,
     w_scales_data,
     M,
@@ -676,15 +668,14 @@ def _gemm_afp4wfp4_jit(
     w_strides[0],
     w_strides[1],
     0 if unit_NUM_KSPLIT else y_pp_stride[0],
-    y.shape[1] if unit_NUM_KSPLIT else y_pp_stride[1],
+    y_shape[1] if unit_NUM_KSPLIT else y_pp_stride[1],
     1 if unit_NUM_KSPLIT else y_pp_stride[2],
     x_scales_strides[0],
     x_scales_strides[1],
     w_scales_strides[0],
     w_scales_strides[1],
     kernel=_gemm_afp4wfp4_kernel,
-    input_output_aliases={2: 0},
-    out_shape=jax.ShapeDtypeStruct(shape=out_tensor_y.shape, dtype=out_tensor_y.dtype),
+    out_shape=jax.ShapeDtypeStruct(shape=out_tensor_y_shape, dtype=out_tensor_y_dtype),
     grid=grid,
     **config,
   )
@@ -707,17 +698,15 @@ def _gemm_afp4wfp4_jit(
 
     y = jt.triton_call(
       y_pp,
-      y,
       M,
       N,
       y_pp_stride[0],
       y_pp_stride[1],
       y_pp_stride[2],
-      y.shape[1],  # y.stride(0),
+      y_shape[1],  # y.stride(0),
       1,  # y.stride(1),
       kernel=_gemm_afp4wfp4_reduce_kernel,
-      out_shape=jax.ShapeDtypeStruct(shape=y.shape, dtype=y.dtype),
-      input_output_aliases={1: 0},
+      out_shape=jax.ShapeDtypeStruct(shape=y_shape, dtype=dtype),
       grid=grid_reduce,
       BLOCK_SIZE_M=REDUCE_BLOCK_SIZE_M,
       BLOCK_SIZE_N=REDUCE_BLOCK_SIZE_N,
